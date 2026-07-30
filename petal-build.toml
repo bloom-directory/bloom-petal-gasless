@@ -1,0 +1,17 @@
+schema = "bloom.petal.build.v1"
+name = "gasless"
+routes = "route/files"
+output = "petal/gasless"
+
+[route_crate]
+package = "gasless-route"
+path = "route"
+alias = "example_route"
+
+[sdk]
+package = "bloom-petal-sdk"
+git = "https://github.com/bloom-directory/petal"
+rev = "b9fc22d6d8211bc41304b38b1ef8b5269c8035bd"
+
+[dependencies]
+serde_json = "1"

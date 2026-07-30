@@ -1,0 +1,28 @@
+schema = "bloom.petal.package.v1"
+name = "gasless"
+
+[source]
+kind = "github"
+repository = "bloom-directory/bloom-petal-gasless"
+
+[build]
+command = "scripts/build.sh"
+outputs = ["petal/gasless"]
+
+[consent]
+summary = "Move native USDC from one supported EVM chain to HyperCore without its gas token using a caller-bounded, owner-approved Relay permit."
+
+[caps]
+allowed = ["bloom:http", "bloom:store", "bloom:sign", "bloom:vfs.read"]
+
+[[net.allow]]
+binding = "relay"
+host = "api.relay.link"
+methods = ["get", "post"]
+paths = ["/quote/v2", "/execute/permits", "/intents/status/v3"]
+
+[sign]
+allowed_intents = ["gasless.deposit"]
+
+[store]
+namespaces = ["state"]
