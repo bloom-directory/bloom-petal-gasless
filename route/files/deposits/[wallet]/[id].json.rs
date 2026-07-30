@@ -1,5 +1,5 @@
 petal::route_file!(
-    spec: petal::write_spec().caps(&[
+    spec: petal::signing_write_spec("gasless.deposit").caps(&[
         "bloom:http",
         "bloom:store",
         "bloom:sign",

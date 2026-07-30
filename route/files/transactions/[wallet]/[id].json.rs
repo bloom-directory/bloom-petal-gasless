@@ -1,17 +1,11 @@
 petal::route_file!(
-    spec: petal::signing_write_spec("gasless.deposit").caps(&[
+    spec: petal::signing_write_spec("gasless.relay").caps(&[
         "bloom:http",
         "bloom:store",
         "bloom:sign",
         "bloom:vfs.read",
     ]),
     read: |ctx: &petal::Ctx| {
-        let source = match petal::param(ctx, "source")
-            .and_then(|value| crate::source_chain(value).map(|chain| chain.slug))
-        {
-            Ok(source) => source,
-            Err(response) => return response,
-        };
         let wallet = match petal::param(ctx, "wallet").and_then(|value| {
             if petal::is_safe_segment(value) && value.len() <= 128 {
                 Ok(value)
@@ -26,24 +20,18 @@ petal::route_file!(
             if petal::is_safe_segment(value) && value.len() <= 128 {
                 Ok(value)
             } else {
-                Err(petal::error(-3, "deposit id is unsafe"))
+                Err(petal::error(-3, "transaction id is unsafe"))
             }
         }) {
             Ok(id) => id,
             Err(response) => return response,
         };
-        crate::gasless_deposit_status(source, wallet, id)
+        crate::gasless_transaction_status(wallet, id)
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {
-        if body.len() > 4096 {
+        if body.len() > 16 * 1024 {
             return petal::error(-3, "request body is too large");
         }
-        let source = match petal::param(ctx, "source")
-            .and_then(|value| crate::source_chain(value).map(|chain| chain.slug))
-        {
-            Ok(source) => source,
-            Err(response) => return response,
-        };
         let wallet = match petal::param(ctx, "wallet").and_then(|value| {
             if petal::is_safe_segment(value) && value.len() <= 128 {
                 Ok(value.to_owned())
@@ -58,7 +46,7 @@ petal::route_file!(
             if petal::is_safe_segment(value) && value.len() <= 128 {
                 Ok(value.to_owned())
             } else {
-                Err(petal::error(-3, "deposit id is unsafe"))
+                Err(petal::error(-3, "transaction id is unsafe"))
             }
         }) {
             Ok(id) => id,
@@ -68,10 +56,10 @@ petal::route_file!(
             Ok(address) => address,
             Err(response) => return response,
         };
-        let request: crate::GaslessDepositRequest = match crate::serde_json::from_slice(body) {
+        let request: crate::RelayTransactionRequest = match crate::serde_json::from_slice(body) {
             Ok(request) => request,
             Err(error) => return petal::error(-3, format!("invalid request JSON: {error}")),
         };
-        crate::gasless_deposit(source, wallet, address, id, request)
+        crate::gasless_transaction(wallet, address, id, request)
     },
 );

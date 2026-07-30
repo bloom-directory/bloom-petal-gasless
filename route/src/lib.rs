@@ -1,8 +1,16 @@
-//! Relay protocol, validation, signing, and durable deposit state.
+//! Relay permit protocol, generic transaction state, and legacy deposit compatibility.
 
+mod legacy;
 mod relay;
 
-pub use relay::*;
+pub use legacy::{
+    GaslessDepositRequest, SOURCE_CHAINS, SourceChain, gasless_deposit, gasless_deposit_status,
+    source_chain,
+};
+pub use relay::{
+    PermitDomain, RelayDestination, RelayOrigin, RelayTransactionRequest, gasless_transaction,
+    gasless_transaction_status,
+};
 pub use serde_json;
 
 pub fn wallet_address(wallet: &str) -> Result<String, petal::DispatchResponse> {

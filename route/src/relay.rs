@@ -1,84 +1,93 @@
 use alloy_dyn_abi::eip712::TypedData;
 use alloy_primitives::B256;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use petal::{
     DispatchResponse, HostStatus, HttpRequest, HttpResponse, SdkError, SignHashOutcome, SignRequest,
 };
 
 const RELAY: &str = "https://api.relay.link";
-const HYPERLIQUID_USDC: &str = "0x00000000000000000000000000000000";
-// Relay v3 ApprovalProxy. Live quotes currently use the same receiver on every
-// supported source, but the receiver remains part of each registry entry so a
-// future chain-specific change must be reviewed explicitly.
+// Relay v3 ApprovalProxy. Every permit quote must independently prove that the
+// authorization is addressed to this receiver before Bloom asks the owner to
+// sign it.
 const RELAY_PERMIT_RECEIVER: &str = "0xccc88a9d1b4ed6b0eaba998850414b24f1c315be";
 const MAX_BODY: usize = 512 * 1024;
-const HYPERCORE_USDC_DECIMALS: usize = 8;
+const MAX_DECIMALS: u8 = 38;
 const PERMIT_SUBMISSION_MARGIN_SECONDS: u64 = 30;
 const SUBMISSION_UNKNOWN: &str =
-    "Relay permit submission outcome is unknown; read this deposit to reconcile its status";
+    "Relay permit submission outcome is unknown; read this transaction to reconcile its status";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SourceChain {
-    pub slug: &'static str,
-    pub chain_id: u64,
-    pub usdc: &'static str,
-    pub usdc_decimals: usize,
-    pub permit_receiver: &'static str,
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermitDomain {
+    pub name: String,
+    pub version: String,
 }
 
-pub const SOURCE_CHAINS: [SourceChain; 6] = [
-    SourceChain {
-        slug: "ethereum",
-        chain_id: 1,
-        usdc: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
-        usdc_decimals: 6,
-        permit_receiver: RELAY_PERMIT_RECEIVER,
-    },
-    SourceChain {
-        slug: "base",
-        chain_id: 8453,
-        usdc: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
-        usdc_decimals: 6,
-        permit_receiver: RELAY_PERMIT_RECEIVER,
-    },
-    SourceChain {
-        slug: "arbitrum",
-        chain_id: 42161,
-        usdc: "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
-        usdc_decimals: 6,
-        permit_receiver: RELAY_PERMIT_RECEIVER,
-    },
-    SourceChain {
-        slug: "optimism",
-        chain_id: 10,
-        usdc: "0x0b2c639c533813f4aa9d7837caf62653d097ff85",
-        usdc_decimals: 6,
-        permit_receiver: RELAY_PERMIT_RECEIVER,
-    },
-    SourceChain {
-        slug: "polygon",
-        chain_id: 137,
-        usdc: "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359",
-        usdc_decimals: 6,
-        permit_receiver: RELAY_PERMIT_RECEIVER,
-    },
-    SourceChain {
-        slug: "avalanche",
-        chain_id: 43114,
-        usdc: "0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e",
-        usdc_decimals: 6,
-        permit_receiver: RELAY_PERMIT_RECEIVER,
-    },
-];
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayOrigin {
+    /// Relay's canonical chain slug, used to validate the signed order.
+    pub chain: String,
+    pub chain_id: u64,
+    /// EIP-3009 token contract on the origin EVM chain.
+    pub currency: String,
+    pub decimals: u8,
+    pub permit_domain: PermitDomain,
+}
 
-pub fn source_chain(slug: &str) -> Result<SourceChain, DispatchResponse> {
-    SOURCE_CHAINS
-        .iter()
-        .copied()
-        .find(|chain| chain.slug == slug)
-        .ok_or_else(|| invalid(format!("unsupported source chain: {slug}")))
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayDestination {
+    /// Relay's canonical chain slug, used to validate the signed order.
+    pub chain: String,
+    pub chain_id: u64,
+    /// Relay currency identifier on the destination chain.
+    pub currency: String,
+    pub decimals: u8,
+    /// Defaults to the resolved Bloom wallet address when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayTransactionRequest {
+    pub origin: RelayOrigin,
+    pub destination: RelayDestination,
+    /// Human-readable exact-input amount, using `origin.decimals`.
+    pub amount: String,
+    /// Caller-required output floor, using `destination.decimals`.
+    pub minimum_output: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct BoundRequest {
+    origin: RelayOrigin,
+    destination: RelayDestination,
+    amount: String,
+    minimum_output: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RelayTransactionState {
+    schema: String,
+    wallet: String,
+    address: String,
+    id: String,
+    request: BoundRequest,
+    amount_units: String,
+    minimum_output_units: String,
+    request_id: String,
+    permit_api: String,
+    phase: String,
+    sign: Value,
+    quote: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    submission: Option<String>,
 }
 
 trait Host {
@@ -134,41 +143,6 @@ impl Host for BloomHost {
     }
 }
 
-fn default_source_chain() -> String {
-    "ethereum".into()
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GaslessDepositRequest {
-    pub amount: String,
-    pub minimum_output: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct DepositState {
-    schema: String,
-    #[serde(default = "default_source_chain")]
-    source_chain: String,
-    wallet: String,
-    address: String,
-    id: String,
-    amount: String,
-    amount_units: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    minimum_output: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    minimum_output_units: Option<String>,
-    request_id: String,
-    phase: String,
-    sign: Value,
-    quote: Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    approval: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    submission: Option<String>,
-}
-
 fn invalid(message: impl Into<String>) -> DispatchResponse {
     petal::error(-3, message)
 }
@@ -181,54 +155,36 @@ fn backend(message: impl Into<String>) -> DispatchResponse {
     petal::error(-4, message)
 }
 
-fn key(chain: SourceChain, wallet: &str, id: &str) -> String {
-    if chain.slug == "ethereum" {
-        // The historical namespace is permanently Ethereum-only. Keeping it
-        // authoritative makes legacy and canonical Ethereum routes converge.
-        format!("state/gasless-deposits/{wallet}/{id}.json")
-    } else {
-        format!(
-            "state/gasless-deposits/by-chain/{}/{wallet}/{id}.json",
-            chain.slug
-        )
-    }
+fn key(wallet: &str, id: &str) -> String {
+    format!("state/relay-transactions/{wallet}/{id}.json")
 }
 
 fn load<H: Host>(
     host: &mut H,
-    chain: SourceChain,
     wallet: &str,
     id: &str,
-) -> Result<Option<DepositState>, DispatchResponse> {
-    match host.store_get(&key(chain, wallet, id), MAX_BODY) {
-        Ok(Some(bytes)) => {
-            let state: DepositState = serde_json::from_slice(&bytes)
-                .map_err(|error| backend(format!("stored deposit is invalid: {error}")))?;
-            if state.source_chain != chain.slug {
-                return Err(backend(
-                    "stored deposit source chain does not match its path",
-                ));
-            }
-            Ok(Some(state))
-        }
+) -> Result<Option<RelayTransactionState>, DispatchResponse> {
+    match host.store_get(&key(wallet, id), MAX_BODY) {
+        Ok(Some(bytes)) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| backend(format!("stored Relay transaction is invalid: {error}"))),
         Ok(None) => Ok(None),
         Err(error) => Err(backend(error)),
     }
 }
 
-fn save<H: Host>(host: &mut H, state: &DepositState) -> Result<(), DispatchResponse> {
-    let chain = source_chain(&state.source_chain)
-        .map_err(|_| backend("stored deposit has an unsupported source chain"))?;
+fn save<H: Host>(host: &mut H, state: &RelayTransactionState) -> Result<(), DispatchResponse> {
     let bytes = serde_json::to_vec(state).map_err(|error| backend(error.to_string()))?;
-    host.store_put(&key(chain, &state.wallet, &state.id), &bytes)
+    host.store_put(&key(&state.wallet, &state.id), &bytes)
         .map_err(backend)
 }
 
-fn save_new<H: Host>(host: &mut H, state: &DepositState) -> Result<bool, DispatchResponse> {
-    let chain = source_chain(&state.source_chain)
-        .map_err(|_| backend("stored deposit has an unsupported source chain"))?;
+fn save_new<H: Host>(
+    host: &mut H,
+    state: &RelayTransactionState,
+) -> Result<bool, DispatchResponse> {
     let bytes = serde_json::to_vec(state).map_err(|error| backend(error.to_string()))?;
-    host.store_put_new(&key(chain, &state.wallet, &state.id), &bytes)
+    host.store_put_new(&key(&state.wallet, &state.id), &bytes)
         .map_err(backend)
 }
 
@@ -262,8 +218,8 @@ fn fetch<H: Host>(
 }
 
 fn submit_permit<H: Host>(host: &mut H, signature: &str, body: Vec<u8>) -> Result<(), ()> {
-    // Relay requires the signature query parameter. Do not propagate any host
-    // error from this request: Bloom's HTTP host may include the complete URL.
+    // Relay requires the signature in the URL. Never return the HTTP host's
+    // error because it may contain the complete replayable URL.
     let response = host
         .http_fetch(
             &HttpRequest {
@@ -297,12 +253,70 @@ fn is_bytes32(value: &str) -> bool {
         && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn decimal_units(amount: &str, decimals: usize, field: &str) -> Result<String, String> {
+fn is_evm_address(value: &str) -> bool {
+    value.len() == 42
+        && value.starts_with("0x")
+        && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn normalize_evm_address(value: &str, field: &str) -> Result<String, DispatchResponse> {
+    if !is_evm_address(value) {
+        return Err(invalid(format!("{field} must be an EVM address")));
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn normalize_relay_identifier(value: &str, field: &str) -> Result<String, DispatchResponse> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'.' | b'_' | b'-'))
+    {
+        return Err(invalid(format!("{field} is not a safe Relay identifier")));
+    }
+    if value.starts_with("0x") {
+        Ok(value.to_ascii_lowercase())
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
+fn normalize_chain(value: &str, field: &str) -> Result<String, DispatchResponse> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(invalid(format!(
+            "{field} must be a lowercase Relay chain slug"
+        )));
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_domain_part(value: &str, field: &str) -> Result<(), DispatchResponse> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte == b' ' || byte.is_ascii_graphic())
+    {
+        return Err(invalid(format!("{field} is invalid")));
+    }
+    Ok(())
+}
+
+fn decimal_units(amount: &str, decimals: u8, field: &str) -> Result<String, String> {
+    if decimals > MAX_DECIMALS {
+        return Err(format!("{field} uses unsupported token precision"));
+    }
     let (whole, fraction) = amount.split_once('.').unwrap_or((amount, ""));
     if whole.is_empty()
         || !whole.bytes().all(|byte| byte.is_ascii_digit())
         || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-        || fraction.len() > decimals
+        || fraction.len() > decimals as usize
     {
         return Err(format!(
             "{field} must be a positive decimal with at most {decimals} places"
@@ -311,9 +325,13 @@ fn decimal_units(amount: &str, decimals: usize, field: &str) -> Result<String, S
     let whole = whole
         .parse::<u128>()
         .map_err(|_| format!("{field} is too large"))?;
-    let fraction = format!("{fraction:0<decimals$}")
-        .parse::<u128>()
-        .map_err(|_| format!("invalid {field}"))?;
+    let fraction = if decimals == 0 {
+        0
+    } else {
+        format!("{fraction:0<width$}", width = decimals as usize)
+            .parse::<u128>()
+            .map_err(|_| format!("invalid {field}"))?
+    };
     let scale = 10_u128
         .checked_pow(decimals as u32)
         .ok_or_else(|| format!("{field} has unsupported precision"))?;
@@ -327,166 +345,291 @@ fn decimal_units(amount: &str, decimals: usize, field: &str) -> Result<String, S
     Ok(units.to_string())
 }
 
-fn format_units(units: u128, decimals: usize) -> String {
+fn format_units(units: u128, decimals: u8) -> String {
     let scale = 10_u128.pow(decimals as u32);
     let whole = units / scale;
     let fraction = units % scale;
     if fraction == 0 {
         return whole.to_string();
     }
-    format!("{whole}.{fraction:0>decimals$}")
+    format!("{whole}.{fraction:0>width$}", width = decimals as usize)
         .trim_end_matches('0')
         .to_string()
+}
+
+fn bind_request(
+    request: RelayTransactionRequest,
+    wallet_address: &str,
+) -> Result<(BoundRequest, String, String), DispatchResponse> {
+    if request.origin.chain_id == 0 || request.destination.chain_id == 0 {
+        return Err(invalid("origin and destination chain IDs must be positive"));
+    }
+    if request.origin.decimals > MAX_DECIMALS || request.destination.decimals > MAX_DECIMALS {
+        return Err(invalid("token precision is unsupported"));
+    }
+    validate_domain_part(
+        &request.origin.permit_domain.name,
+        "origin.permit_domain.name",
+    )?;
+    validate_domain_part(
+        &request.origin.permit_domain.version,
+        "origin.permit_domain.version",
+    )?;
+
+    let origin = RelayOrigin {
+        chain: normalize_chain(&request.origin.chain, "origin.chain")?,
+        chain_id: request.origin.chain_id,
+        currency: normalize_evm_address(&request.origin.currency, "origin.currency")?,
+        decimals: request.origin.decimals,
+        permit_domain: request.origin.permit_domain,
+    };
+    let destination = RelayDestination {
+        chain: normalize_chain(&request.destination.chain, "destination.chain")?,
+        chain_id: request.destination.chain_id,
+        currency: normalize_relay_identifier(
+            &request.destination.currency,
+            "destination.currency",
+        )?,
+        decimals: request.destination.decimals,
+        recipient: Some(match request.destination.recipient {
+            Some(recipient) => normalize_relay_identifier(&recipient, "destination.recipient")?,
+            None => wallet_address.to_ascii_lowercase(),
+        }),
+    };
+    let amount_units =
+        decimal_units(&request.amount, origin.decimals, "amount").map_err(invalid)?;
+    let minimum_output_units = decimal_units(
+        &request.minimum_output,
+        destination.decimals,
+        "minimum_output",
+    )
+    .map_err(invalid)?;
+
+    Ok((
+        BoundRequest {
+            origin,
+            destination,
+            amount: request.amount,
+            minimum_output: request.minimum_output,
+        },
+        amount_units,
+        minimum_output_units,
+    ))
+}
+
+fn identifier_eq(actual: Option<&str>, expected: &str) -> bool {
+    actual.is_some_and(|actual| {
+        if expected.starts_with("0x") {
+            actual.eq_ignore_ascii_case(expected)
+        } else {
+            actual == expected
+        }
+    })
+}
+
+fn uint64_value(value: Option<&Value>) -> Option<u64> {
+    value.and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+    })
 }
 
 #[derive(Clone, Copy)]
 struct QuoteInput<'a> {
     wallet: &'a str,
     address: &'a str,
-    amount: &'a str,
-    units: &'a str,
-    minimum_output: &'a str,
+    request: &'a BoundRequest,
+    amount_units: &'a str,
     minimum_output_units: &'a str,
 }
 
 fn quote<H: Host>(
     host: &mut H,
-    chain: SourceChain,
     input: QuoteInput<'_>,
-) -> Result<DepositState, DispatchResponse> {
+) -> Result<RelayTransactionState, DispatchResponse> {
+    let recipient = input.request.destination.recipient.as_deref().unwrap();
     let body = serde_json::to_vec(&json!({
         "user": input.address,
-        "originChainId": chain.chain_id,
-        "destinationChainId": 1337,
-        "originCurrency": chain.usdc,
-        "destinationCurrency": HYPERLIQUID_USDC,
-        "recipient": input.address,
+        "originChainId": input.request.origin.chain_id,
+        "destinationChainId": input.request.destination.chain_id,
+        "originCurrency": input.request.origin.currency,
+        "destinationCurrency": input.request.destination.currency,
+        "recipient": recipient,
         "tradeType": "EXACT_INPUT",
-        "amount": input.units,
+        "amount": input.amount_units,
         "refundTo": input.address,
         "usePermit": true,
-        "slippageTolerance": "50"
+        // Same-chain swaps otherwise commonly return an onchain transaction
+        // step instead of the requested permit flow.
+        "forceSolverExecution": true
     }))
     .map_err(|error| backend(error.to_string()))?;
     let response = fetch(host, "POST", "/quote/v2", body)?;
-    prepare_quote(chain, input, response)
+    prepare_quote(input, response)
 }
 
 fn prepare_quote(
-    chain: SourceChain,
     input: QuoteInput<'_>,
     response: Value,
-) -> Result<DepositState, DispatchResponse> {
+) -> Result<RelayTransactionState, DispatchResponse> {
     let step = response
         .get("steps")
         .and_then(Value::as_array)
-        .and_then(|steps| {
-            steps
-                .iter()
-                .find(|step| step.get("id").and_then(Value::as_str) == Some("authorize1"))
-        })
+        .filter(|steps| steps.len() == 1)
+        .and_then(|steps| steps.first())
+        .filter(|step| step.get("id").and_then(Value::as_str) == Some("authorize1"))
         .ok_or_else(|| {
             backend(format!(
-                "Relay offered no gasless USDC authorization: {}",
+                "Relay did not offer exactly one EIP-3009 gasless authorization: {}",
                 compact(&response)
             ))
         })?;
     if step.get("kind").and_then(Value::as_str) != Some("signature") {
-        return Err(backend("Relay gasless step was not a signature"));
+        return Err(backend("Relay gasless authorization was not a signature"));
     }
     let item = step
         .get("items")
         .and_then(Value::as_array)
+        .filter(|items| items.len() == 1)
         .and_then(|items| items.first())
-        .ok_or_else(|| backend("Relay gasless step had no item"))?;
+        .ok_or_else(|| backend("Relay gasless authorization did not contain exactly one item"))?;
     let sign = item
         .pointer("/data/sign")
         .cloned()
-        .ok_or_else(|| backend("Relay gasless step omitted signing data"))?;
+        .ok_or_else(|| backend("Relay gasless authorization omitted signing data"))?;
     let request_id = item
         .pointer("/data/post/body/requestId")
         .and_then(Value::as_str)
-        .ok_or_else(|| backend("Relay gasless step omitted request id"))?;
+        .ok_or_else(|| backend("Relay gasless authorization omitted request ID"))?;
     if !is_bytes32(request_id) {
-        return Err(backend("Relay gasless step returned an invalid request id"));
+        return Err(backend(
+            "Relay gasless authorization returned an invalid request ID",
+        ));
+    }
+    if step.get("requestId").and_then(Value::as_str) != Some(request_id) {
+        return Err(backend("Relay returned inconsistent request IDs"));
     }
 
-    let (_, permit_valid_before) = validate_sign(chain, input.address, input.units, &sign)?;
+    let (_, permit_valid_before) = validate_sign(input, &sign)?;
+    let permit_api = item
+        .pointer("/data/post/body/api")
+        .and_then(Value::as_str)
+        .filter(|api| matches!(*api, "bridge" | "swap" | "user-swap"))
+        .ok_or_else(|| backend("Relay returned an unsupported permit API"))?;
     if item.pointer("/data/post/endpoint").and_then(Value::as_str) != Some("/execute/permits")
         || item.pointer("/data/post/method").and_then(Value::as_str) != Some("POST")
         || item.pointer("/data/post/body/kind").and_then(Value::as_str) != Some("eip3009")
-        || item.pointer("/data/post/body/api").and_then(Value::as_str) != Some("swap")
-        || step.get("requestId").and_then(Value::as_str) != Some(request_id)
     {
         return Err(backend(
             "Relay returned an unexpected permit submission contract",
         ));
     }
     let expected_check = format!("/intents/status/v3?requestId={request_id}");
-    if item.pointer("/check/endpoint").and_then(Value::as_str) != Some(&expected_check) {
+    if item.pointer("/check/endpoint").and_then(Value::as_str) != Some(&expected_check)
+        || item.pointer("/check/method").and_then(Value::as_str) != Some("GET")
+    {
         return Err(backend("Relay returned an unexpected status endpoint"));
     }
+
     let details = response
         .get("details")
         .ok_or_else(|| backend("Relay quote omitted details"))?;
-    if details
-        .pointer("/currencyIn/currency/chainId")
-        .and_then(Value::as_u64)
-        != Some(chain.chain_id)
-        || details
-            .pointer("/currencyIn/currency/address")
-            .and_then(Value::as_str)
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-            != Some(chain.usdc)
-        || details
-            .pointer("/currencyIn/currency/decimals")
-            .and_then(Value::as_u64)
-            != Some(chain.usdc_decimals as u64)
-        || details
-            .pointer("/currencyOut/currency/chainId")
-            .and_then(Value::as_u64)
-            != Some(1337)
-        || details
-            .pointer("/currencyOut/currency/address")
-            .and_then(Value::as_str)
-            != Some(HYPERLIQUID_USDC)
-        || details
-            .pointer("/currencyOut/currency/decimals")
-            .and_then(Value::as_u64)
-            != Some(HYPERCORE_USDC_DECIMALS as u64)
-        || details
-            .pointer("/refundCurrency/currency/chainId")
-            .and_then(Value::as_u64)
-            != Some(chain.chain_id)
-        || details
-            .pointer("/refundCurrency/currency/address")
-            .and_then(Value::as_str)
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-            != Some(chain.usdc)
-        || details
-            .pointer("/refundCurrency/currency/decimals")
-            .and_then(Value::as_u64)
-            != Some(chain.usdc_decimals as u64)
-        || details.get("recipient").and_then(Value::as_str) != Some(input.address)
+    validate_quote_details(input, details)?;
+    let (amount_out_units, relay_minimum_out_units) = validate_output_floor(input, details)?;
+    validate_order(input, &response, amount_out_units, relay_minimum_out_units)?;
+
+    Ok(RelayTransactionState {
+        schema: "bloom.gasless.relay-transaction.v1".into(),
+        wallet: input.wallet.into(),
+        address: input.address.into(),
+        id: String::new(),
+        request: input.request.clone(),
+        amount_units: input.amount_units.into(),
+        minimum_output_units: input.minimum_output_units.into(),
+        request_id: request_id.into(),
+        permit_api: permit_api.into(),
+        phase: "awaiting_signature".into(),
+        sign,
+        quote: json!({
+            "amount_in": details.pointer("/currencyIn/amountFormatted"),
+            "amount_in_units": input.amount_units,
+            "amount_out": details.pointer("/currencyOut/amountFormatted"),
+            "amount_out_units": amount_out_units.to_string(),
+            "relay_minimum_out_units": relay_minimum_out_units.to_string(),
+            "required_minimum_out": input.request.minimum_output,
+            "required_minimum_out_units": input.minimum_output_units,
+            "total_impact": details.get("totalImpact"),
+            "expanded_price_impact": details.get("expandedPriceImpact"),
+            "time_estimate_seconds": details.get("timeEstimate"),
+            "permit_valid_before_unix_seconds": permit_valid_before,
+            "provider": "relay"
+        }),
+        approval: None,
+        submission: None,
+    })
+}
+
+fn validate_quote_details(input: QuoteInput<'_>, details: &Value) -> Result<(), DispatchResponse> {
+    let origin = &input.request.origin;
+    let destination = &input.request.destination;
+    let recipient = destination.recipient.as_deref().unwrap();
+    if !identifier_eq(details.get("sender").and_then(Value::as_str), input.address) {
+        return Err(backend("Relay quote changed the sender"));
+    }
+    if !identifier_eq(details.get("recipient").and_then(Value::as_str), recipient)
+        || uint64_value(details.pointer("/currencyIn/currency/chainId")) != Some(origin.chain_id)
+        || !identifier_eq(
+            details
+                .pointer("/currencyIn/currency/address")
+                .and_then(Value::as_str),
+            &origin.currency,
+        )
+        || uint64_value(details.pointer("/currencyIn/currency/decimals"))
+            != Some(origin.decimals as u64)
+        || uint64_value(details.pointer("/currencyOut/currency/chainId"))
+            != Some(destination.chain_id)
+        || !identifier_eq(
+            details
+                .pointer("/currencyOut/currency/address")
+                .and_then(Value::as_str),
+            &destination.currency,
+        )
+        || uint64_value(details.pointer("/currencyOut/currency/decimals"))
+            != Some(destination.decimals as u64)
+        || uint64_value(details.pointer("/refundCurrency/currency/chainId"))
+            != Some(origin.chain_id)
+        || !identifier_eq(
+            details
+                .pointer("/refundCurrency/currency/address")
+                .and_then(Value::as_str),
+            &origin.currency,
+        )
+        || uint64_value(details.pointer("/refundCurrency/currency/decimals"))
+            != Some(origin.decimals as u64)
     {
         return Err(backend(
-            "Relay quote changed the requested asset, chain, or recipient",
+            "Relay quote changed the requested chain, currency, precision, or recipient",
         ));
     }
     if details
         .pointer("/currencyIn/amount")
         .and_then(Value::as_str)
-        != Some(input.units)
+        != Some(input.amount_units)
         || details
             .pointer("/refundCurrency/amount")
             .and_then(Value::as_str)
-            != Some(input.units)
+            != Some(input.amount_units)
     {
-        return Err(backend("Relay quote changed the requested input amount"));
+        return Err(backend("Relay quote changed the exact input amount"));
     }
-    validate_refunds(&response, chain, input.address)?;
+    Ok(())
+}
+
+fn validate_output_floor(
+    input: QuoteInput<'_>,
+    details: &Value,
+) -> Result<(u128, u128), DispatchResponse> {
     let amount_out_units = details
         .pointer("/currencyOut/amount")
         .and_then(Value::as_str)
@@ -510,97 +653,130 @@ fn prepare_quote(
     }
     if relay_minimum_out_units < required_minimum_out_units {
         return Err(invalid(format!(
-            "Relay slippage-adjusted minimum output {} is below required minimum_output {}",
-            format_units(relay_minimum_out_units, HYPERCORE_USDC_DECIMALS),
-            input.minimum_output,
+            "Relay minimum output {} is below required minimum_output {}",
+            format_units(relay_minimum_out_units, input.request.destination.decimals),
+            input.request.minimum_output,
         )));
     }
-
-    Ok(DepositState {
-        schema: "bloom.gasless.deposit.v2".into(),
-        source_chain: chain.slug.into(),
-        wallet: input.wallet.into(),
-        address: input.address.into(),
-        id: String::new(),
-        amount: input.amount.into(),
-        amount_units: input.units.into(),
-        minimum_output: Some(input.minimum_output.into()),
-        minimum_output_units: Some(input.minimum_output_units.into()),
-        request_id: request_id.into(),
-        phase: "awaiting_signature".into(),
-        sign,
-        quote: json!({
-            "amount_in": details.pointer("/currencyIn/amountFormatted"),
-            "amount_out": details.pointer("/currencyOut/amountFormatted"),
-            "minimum_out_units": details.pointer("/currencyOut/minimumAmount"),
-            "required_minimum_out": input.minimum_output,
-            "required_minimum_out_units": input.minimum_output_units,
-            "total_impact": details.get("totalImpact"),
-            "time_estimate_seconds": details.get("timeEstimate"),
-            "permit_valid_before_unix_seconds": permit_valid_before,
-            "source_chain": chain.slug,
-            "source_chain_id": chain.chain_id,
-            "source_currency": chain.usdc,
-            "provider": "relay"
-        }),
-        approval: None,
-        submission: None,
-    })
+    Ok((amount_out_units, relay_minimum_out_units))
 }
 
-fn validate_refunds(
+fn validate_order(
+    input: QuoteInput<'_>,
     response: &Value,
-    chain: SourceChain,
-    address: &str,
+    amount_out_units: u128,
+    relay_minimum_out_units: u128,
 ) -> Result<(), DispatchResponse> {
-    let refunds = response
-        .pointer("/protocol/v2/orderData/inputs/0/refunds")
+    let order = response
+        .pointer("/protocol/v2/orderData")
+        .ok_or_else(|| backend("Relay quote omitted signed order data"))?;
+    let inputs = order
+        .get("inputs")
         .and_then(Value::as_array)
-        .ok_or_else(|| backend("Relay quote omitted its refund plan"))?;
-    let matches = |refund: &Value, expected_chain: &str, expected_currency: &str| {
-        refund.get("chainId").and_then(Value::as_str) == Some(expected_chain)
-            && refund
-                .get("recipient")
-                .and_then(Value::as_str)
-                .map(str::to_ascii_lowercase)
-                .as_deref()
-                == Some(address)
-            && refund
-                .get("currency")
-                .and_then(Value::as_str)
-                .map(str::to_ascii_lowercase)
-                .as_deref()
-                == Some(expected_currency)
+        .filter(|inputs| inputs.len() == 1)
+        .ok_or_else(|| backend("Relay order did not contain exactly one input"))?;
+    let order_input = &inputs[0];
+    if order_input
+        .pointer("/payment/chainId")
+        .and_then(Value::as_str)
+        != Some(&input.request.origin.chain)
+        || !identifier_eq(
+            order_input
+                .pointer("/payment/currency")
+                .and_then(Value::as_str),
+            &input.request.origin.currency,
+        )
+        || order_input
+            .pointer("/payment/amount")
+            .and_then(Value::as_str)
+            != Some(input.amount_units)
+    {
+        return Err(backend("Relay order changed the origin payment"));
+    }
+
+    let refunds = order_input
+        .get("refunds")
+        .and_then(Value::as_array)
+        .filter(|refunds| refunds.len() == 2)
+        .ok_or_else(|| backend("Relay order did not contain exactly two refund branches"))?;
+    let refund_matches = |refund: &Value, chain: &str, currency: &str| {
+        refund.get("chainId").and_then(Value::as_str) == Some(chain)
+            && identifier_eq(refund.get("currency").and_then(Value::as_str), currency)
+            && identifier_eq(
+                refund.get("recipient").and_then(Value::as_str),
+                input.address,
+            )
     };
-    if refunds.len() != 2
-        || !refunds
-            .iter()
-            .any(|refund| matches(refund, chain.slug, chain.usdc))
-        || !refunds
-            .iter()
-            .any(|refund| matches(refund, "hyperliquid", HYPERLIQUID_USDC))
+    if !refunds.iter().any(|refund| {
+        refund_matches(
+            refund,
+            &input.request.origin.chain,
+            &input.request.origin.currency,
+        )
+    }) || !refunds.iter().any(|refund| {
+        refund_matches(
+            refund,
+            &input.request.destination.chain,
+            &input.request.destination.currency,
+        )
+    }) {
+        return Err(backend(
+            "Relay order changed the refund address, currency, or chain",
+        ));
+    }
+
+    let output = order
+        .get("output")
+        .ok_or_else(|| backend("Relay order omitted its output"))?;
+    if output.get("chainId").and_then(Value::as_str) != Some(&input.request.destination.chain) {
+        return Err(backend("Relay order changed the destination chain"));
+    }
+    let payments = output
+        .get("payments")
+        .and_then(Value::as_array)
+        .filter(|payments| payments.len() == 1)
+        .ok_or_else(|| backend("Relay order did not contain exactly one output payment"))?;
+    let payment = &payments[0];
+    if !identifier_eq(
+        payment.get("recipient").and_then(Value::as_str),
+        input.request.destination.recipient.as_deref().unwrap(),
+    ) || !identifier_eq(
+        payment.get("currency").and_then(Value::as_str),
+        &input.request.destination.currency,
+    ) || payment.get("minimumAmount").and_then(Value::as_str)
+        != Some(&relay_minimum_out_units.to_string())
+        || payment.get("expectedAmount").and_then(Value::as_str)
+            != Some(&amount_out_units.to_string())
+    {
+        return Err(backend("Relay order changed the destination payment"));
+    }
+    if output
+        .get("calls")
+        .and_then(Value::as_array)
+        .is_none_or(|calls| !calls.is_empty())
     {
         return Err(backend(
-            "Relay quote changed the requested refund address, asset, or chain",
+            "Relay returned destination calls for a transfer-only route",
         ));
+    }
+    if order
+        .get("fees")
+        .and_then(Value::as_array)
+        .is_none_or(|fees| !fees.is_empty())
+    {
+        return Err(backend("Relay returned unexpected application fees"));
     }
     Ok(())
 }
 
-fn uint64_value(value: Option<&Value>) -> Option<u64> {
-    value.and_then(|value| {
-        value
-            .as_u64()
-            .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
-    })
-}
-
-fn validate_sign(
-    chain: SourceChain,
-    wallet: &str,
-    units: &str,
-    sign: &Value,
-) -> Result<(u64, u64), DispatchResponse> {
+fn validate_sign(input: QuoteInput<'_>, sign: &Value) -> Result<(u64, u64), DispatchResponse> {
+    let primary_type = sign.get("primaryType").and_then(Value::as_str);
+    if !matches!(
+        primary_type,
+        Some("ReceiveWithAuthorization" | "TransferWithAuthorization")
+    ) {
+        return Err(backend("Relay returned an unsupported EIP-3009 type"));
+    }
     let expected_types = json!([
         {"name":"from","type":"address"},
         {"name":"to","type":"address"},
@@ -609,27 +785,34 @@ fn validate_sign(
         {"name":"validBefore","type":"uint256"},
         {"name":"nonce","type":"bytes32"}
     ]);
-    let from = sign.pointer("/value/from").and_then(Value::as_str);
-    let to = sign.pointer("/value/to").and_then(Value::as_str);
-    let nonce = sign.pointer("/value/nonce").and_then(Value::as_str);
+    let type_path = format!("/types/{}", primary_type.unwrap());
     let valid_after = uint64_value(sign.pointer("/value/validAfter"));
     let valid_before = uint64_value(sign.pointer("/value/validBefore"));
     if sign.get("signatureKind").and_then(Value::as_str) != Some("eip712")
-        || sign.get("primaryType").and_then(Value::as_str) != Some("ReceiveWithAuthorization")
-        || sign.pointer("/domain/name").and_then(Value::as_str) != Some("USD Coin")
-        || sign.pointer("/domain/version").and_then(Value::as_str) != Some("2")
-        || uint64_value(sign.pointer("/domain/chainId")) != Some(chain.chain_id)
+        || sign.pointer("/domain/name").and_then(Value::as_str)
+            != Some(&input.request.origin.permit_domain.name)
+        || sign.pointer("/domain/version").and_then(Value::as_str)
+            != Some(&input.request.origin.permit_domain.version)
+        || uint64_value(sign.pointer("/domain/chainId")) != Some(input.request.origin.chain_id)
+        || !identifier_eq(
+            sign.pointer("/domain/verifyingContract")
+                .and_then(Value::as_str),
+            &input.request.origin.currency,
+        )
+        || sign.pointer(&type_path) != Some(&expected_types)
+        || !identifier_eq(
+            sign.pointer("/value/from").and_then(Value::as_str),
+            input.address,
+        )
+        || !identifier_eq(
+            sign.pointer("/value/to").and_then(Value::as_str),
+            RELAY_PERMIT_RECEIVER,
+        )
+        || sign.pointer("/value/value").and_then(Value::as_str) != Some(input.amount_units)
         || sign
-            .pointer("/domain/verifyingContract")
+            .pointer("/value/nonce")
             .and_then(Value::as_str)
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-            != Some(chain.usdc)
-        || sign.pointer("/types/ReceiveWithAuthorization") != Some(&expected_types)
-        || from.map(str::to_ascii_lowercase).as_deref() != Some(wallet)
-        || sign.pointer("/value/value").and_then(Value::as_str) != Some(units)
-        || to.map(str::to_ascii_lowercase).as_deref() != Some(chain.permit_receiver)
-        || nonce.is_none_or(|value| !is_bytes32(value))
+            .is_none_or(|value| !is_bytes32(value))
         || valid_after
             .zip(valid_before)
             .is_none_or(|(after, before)| after >= before)
@@ -640,17 +823,29 @@ fn validate_sign(
 }
 
 fn signing_hash(sign: &Value) -> Result<B256, DispatchResponse> {
+    let primary_type = sign
+        .get("primaryType")
+        .and_then(Value::as_str)
+        .ok_or_else(|| backend("Relay typed data omitted its primary type"))?;
+    let mut types = Map::new();
+    types.insert(
+        "EIP712Domain".into(),
+        json!([
+            {"name":"name","type":"string"},
+            {"name":"version","type":"string"},
+            {"name":"chainId","type":"uint256"},
+            {"name":"verifyingContract","type":"address"}
+        ]),
+    );
+    types.insert(
+        primary_type.into(),
+        sign.pointer(&format!("/types/{primary_type}"))
+            .cloned()
+            .ok_or_else(|| backend("Relay typed data omitted its authorization type"))?,
+    );
     let typed: TypedData = serde_json::from_value(json!({
-        "types": {
-            "EIP712Domain": [
-                {"name":"name","type":"string"},
-                {"name":"version","type":"string"},
-                {"name":"chainId","type":"uint256"},
-                {"name":"verifyingContract","type":"address"}
-            ],
-            "ReceiveWithAuthorization": sign.pointer("/types/ReceiveWithAuthorization")
-        },
-        "primaryType": "ReceiveWithAuthorization",
+        "types": types,
+        "primaryType": primary_type,
         "domain": sign.get("domain"),
         "message": sign.get("value")
     }))
@@ -668,19 +863,23 @@ fn signature_hex(mut bytes: Vec<u8>) -> Result<String, DispatchResponse> {
         bytes[64] += 27;
     }
     if !matches!(bytes[64], 27 | 28) {
-        return Err(backend("wallet returned an invalid EVM recovery id"));
+        return Err(backend("wallet returned an invalid EVM recovery ID"));
     }
     Ok(format!("0x{}", hex::encode(bytes)))
 }
 
 fn ensure_permit_live<H: Host>(
     host: &mut H,
-    chain: SourceChain,
-    wallet: &str,
-    units: &str,
-    sign: &Value,
+    state: &RelayTransactionState,
 ) -> Result<(), DispatchResponse> {
-    let (valid_after, valid_before) = validate_sign(chain, wallet, units, sign)?;
+    let input = QuoteInput {
+        wallet: &state.wallet,
+        address: &state.address,
+        request: &state.request,
+        amount_units: &state.amount_units,
+        minimum_output_units: &state.minimum_output_units,
+    };
+    let (valid_after, valid_before) = validate_sign(input, &state.sign)?;
     let now_seconds = host
         .now_ms()
         .map_err(|error| backend(format!("cannot check Relay permit expiry: {error}")))?
@@ -690,90 +889,64 @@ fn ensure_permit_live<H: Host>(
     }
     if now_seconds.saturating_add(PERMIT_SUBMISSION_MARGIN_SECONDS) >= valid_before {
         return Err(invalid(
-            "Relay quote permit has expired or is too close to expiry; use a new deposit id",
+            "Relay quote permit has expired or is too close to expiry; use a new transaction ID",
         ));
     }
     Ok(())
 }
 
-fn retry_write_body(state: &DepositState) -> Value {
-    match state.minimum_output.as_deref() {
-        Some(minimum_output) => json!({
-            "amount": state.amount,
-            "minimum_output": minimum_output
-        }),
-        None => json!({"amount": state.amount}),
-    }
+fn retry_write_body(state: &RelayTransactionState) -> Value {
+    serde_json::to_value(&state.request).unwrap_or(Value::Null)
 }
 
 fn validate_request_constraints(
-    state: &DepositState,
+    state: &RelayTransactionState,
     address: &str,
-    units: &str,
+    request: &BoundRequest,
+    amount_units: &str,
     minimum_output_units: &str,
 ) -> Result<(), DispatchResponse> {
     if state.address != address
-        || state.amount_units != units
-        || state.minimum_output_units.as_deref() != Some(minimum_output_units)
+        || &state.request != request
+        || state.amount_units != amount_units
+        || state.minimum_output_units != minimum_output_units
     {
         return Err(invalid(
-            "deposit id already belongs to a different wallet address, amount, or minimum_output constraint",
+            "transaction ID already belongs to a different wallet, route, amount, or output constraint",
         ));
     }
     Ok(())
 }
 
-fn resolve_initialization_conflict(
-    existing: Option<DepositState>,
-    address: &str,
-    units: &str,
-    minimum_output_units: &str,
-) -> Result<DepositState, DispatchResponse> {
-    let existing = existing
-        .ok_or_else(|| backend("deposit initialization conflicted but no state was found"))?;
-    validate_request_constraints(&existing, address, units, minimum_output_units)?;
-    Ok(existing)
-}
-
-pub fn gasless_deposit(
-    source: &str,
+pub fn gasless_transaction(
     wallet: String,
     address: String,
     id: String,
-    request: GaslessDepositRequest,
+    request: RelayTransactionRequest,
 ) -> DispatchResponse {
-    gasless_deposit_with_host(&mut BloomHost, source, wallet, address, id, request)
+    gasless_transaction_with_host(&mut BloomHost, wallet, address, id, request)
 }
 
-fn gasless_deposit_with_host<H: Host>(
+fn gasless_transaction_with_host<H: Host>(
     host: &mut H,
-    source: &str,
     wallet: String,
     address: String,
     id: String,
-    request: GaslessDepositRequest,
+    request: RelayTransactionRequest,
 ) -> DispatchResponse {
-    let chain = match source_chain(source) {
-        Ok(chain) => chain,
+    let (request, amount_units, minimum_output_units) = match bind_request(request, &address) {
+        Ok(bound) => bound,
         Err(error) => return error,
     };
-    let units = match decimal_units(&request.amount, chain.usdc_decimals, "amount") {
-        Ok(units) => units,
-        Err(error) => return invalid(error),
-    };
-    let minimum_output_units = match decimal_units(
-        &request.minimum_output,
-        HYPERCORE_USDC_DECIMALS,
-        "minimum_output",
-    ) {
-        Ok(units) => units,
-        Err(error) => return invalid(error),
-    };
-    let mut state = match load(host, chain, &wallet, &id) {
+    let mut state = match load(host, &wallet, &id) {
         Ok(Some(state)) => {
-            if let Err(error) =
-                validate_request_constraints(&state, &address, &units, &minimum_output_units)
-            {
+            if let Err(error) = validate_request_constraints(
+                &state,
+                &address,
+                &request,
+                &amount_units,
+                &minimum_output_units,
+            ) {
                 return error;
             }
             if state.phase == "submitted" {
@@ -781,48 +954,49 @@ fn gasless_deposit_with_host<H: Host>(
             }
             state
         }
-        Ok(None) => match quote(
-            host,
-            chain,
-            QuoteInput {
+        Ok(None) => {
+            let input = QuoteInput {
                 wallet: &wallet,
                 address: &address,
-                amount: &request.amount,
-                units: &units,
-                minimum_output: &request.minimum_output,
+                request: &request,
+                amount_units: &amount_units,
                 minimum_output_units: &minimum_output_units,
-            },
-        ) {
-            Ok(mut state) => {
-                state.id.clone_from(&id);
-                match save_new(host, &state) {
-                    Ok(true) => state,
-                    Ok(false) => match load(host, chain, &wallet, &id) {
-                        Ok(existing) => match resolve_initialization_conflict(
-                            existing,
-                            &address,
-                            &units,
-                            &minimum_output_units,
-                        ) {
-                            Ok(existing) => existing,
+            };
+            match quote(host, input) {
+                Ok(mut state) => {
+                    state.id.clone_from(&id);
+                    match save_new(host, &state) {
+                        Ok(true) => state,
+                        Ok(false) => match load(host, &wallet, &id) {
+                            Ok(Some(existing)) => {
+                                if let Err(error) = validate_request_constraints(
+                                    &existing,
+                                    &address,
+                                    &request,
+                                    &amount_units,
+                                    &minimum_output_units,
+                                ) {
+                                    return error;
+                                }
+                                existing
+                            }
+                            Ok(None) => {
+                                return backend(
+                                    "transaction initialization conflicted but no state was found",
+                                );
+                            }
                             Err(error) => return error,
                         },
                         Err(error) => return error,
-                    },
-                    Err(error) => return error,
+                    }
                 }
+                Err(error) => return error,
             }
-            Err(error) => return error,
-        },
+        }
         Err(error) => return error,
     };
-    if let Err(error) = ensure_permit_live(
-        host,
-        chain,
-        &state.address,
-        &state.amount_units,
-        &state.sign,
-    ) {
+
+    if let Err(error) = ensure_permit_live(host, &state) {
         return error;
     }
     let hash = match signing_hash(&state.sign) {
@@ -834,7 +1008,7 @@ fn gasless_deposit_with_host<H: Host>(
     let signature = match host.sign_hash(&SignRequest {
         wallet: wallet.clone(),
         hash32,
-        purpose: "gasless.deposit".into(),
+        purpose: "gasless.relay".into(),
     }) {
         Ok(SignHashOutcome::Signature(bytes)) => match signature_hex(bytes) {
             Ok(signature) => signature,
@@ -857,16 +1031,17 @@ fn gasless_deposit_with_host<H: Host>(
                 return error;
             }
             return denied(format!(
-                "review quote, approve the gasless Hyperliquid deposit, then retry the exact write: {}",
+                "review the Relay route and required minimum output, approve it, then retry the exact write: {}",
                 compact(state.approval.as_ref().unwrap())
             ));
         }
         Err(error) => return denied(format!("signing denied: {error}")),
     };
+
     let body = serde_json::to_vec(&json!({
         "kind": "eip3009",
         "requestId": state.request_id,
-        "api": "swap"
+        "api": state.permit_api
     }))
     .unwrap();
     state.phase = "submitting".into();
@@ -879,14 +1054,13 @@ fn gasless_deposit_with_host<H: Host>(
         Err(()) => {
             state.phase = "submission_unknown".into();
             state.submission = Some("unknown".into());
-            if let Err(save_error) = save(host, &state) {
-                return save_error;
+            if let Err(error) = save(host, &state) {
+                return error;
             }
             return backend(SUBMISSION_UNKNOWN);
         }
     }
     state.phase = "submitted".into();
-    state.approval = None;
     state.submission = Some("accepted".into());
     if let Err(error) = save(host, &state) {
         return error;
@@ -901,7 +1075,7 @@ fn attempted_submission(phase: &str) -> bool {
     )
 }
 
-fn relay_status_projection(value: &Value) -> Option<Value> {
+fn relay_status_projection(state: &RelayTransactionState, value: &Value) -> Option<Value> {
     let status = value.get("status").and_then(Value::as_str)?;
     if !matches!(
         status,
@@ -914,6 +1088,15 @@ fn relay_status_projection(value: &Value) -> Option<Value> {
             | "refund"
             | "failure"
     ) {
+        return None;
+    }
+    if value
+        .get("originChainId")
+        .is_some_and(|value| uint64_value(Some(value)) != Some(state.request.origin.chain_id))
+        || value.get("destinationChainId").is_some_and(|value| {
+            uint64_value(Some(value)) != Some(state.request.destination.chain_id)
+        })
+    {
         return None;
     }
     let valid_hashes = |field: &str| {
@@ -955,12 +1138,9 @@ fn public_status(phase: &str, relay_status: Option<&Value>) -> String {
         })
 }
 
-fn effective_local_phase(state: &DepositState, now_ms: u64) -> String {
+fn effective_local_phase(state: &RelayTransactionState, now_ms: u64) -> String {
     if attempted_submission(&state.phase) || now_ms == 0 {
         return state.phase.clone();
-    }
-    if state.minimum_output_units.is_none() {
-        return "quote_unbounded".into();
     }
     let now_seconds = now_ms / 1_000;
     if uint64_value(state.sign.pointer("/value/validBefore")).is_some_and(|valid_before| {
@@ -981,11 +1161,11 @@ fn effective_local_phase(state: &DepositState, now_ms: u64) -> String {
     state.phase.clone()
 }
 
-fn next_action(state: &DepositState, status: &str) -> Value {
+fn next_action(state: &RelayTransactionState, status: &str) -> Value {
     match status {
         "approval_required" => json!({
-            "action": "review_quote_then_approve",
-            "instruction": "Review quote and required minimum output, open approval.ceremony_url, then retry the exact write body.",
+            "action": "review_route_then_approve",
+            "instruction": "Review the exact origin, destination, recipient, quote, and minimum output; open approval.ceremony_url; then retry the exact write body.",
             "retry_write_body": retry_write_body(state)
         }),
         "approval_expired" => json!({
@@ -994,17 +1174,13 @@ fn next_action(state: &DepositState, status: &str) -> Value {
             "retry_write_body": retry_write_body(state)
         }),
         "quote_expired" => json!({
-            "action": "create_new_deposit",
-            "instruction": "The Relay permit expired. Use a new deposit id to obtain and review a new quote; this deposit will not silently re-quote."
-        }),
-        "quote_unbounded" => json!({
-            "action": "create_new_deposit",
-            "instruction": "This legacy quote has no caller-defined minimum output. Use a new deposit id with minimum_output; it is unsafe to continue this deposit."
+            "action": "create_new_transaction",
+            "instruction": "The Relay permit expired. Use a new transaction ID; this transaction will not silently re-quote."
         }),
         "submitting" | "submission_unknown" | "submission_failed" | "submitted" | "waiting"
         | "depositing" | "pending" | "delayed" => json!({
             "action": "poll",
-            "instruction": "Read this deposit again; only Relay status success means completion."
+            "instruction": "Read this transaction again; only Relay status success means completion."
         }),
         "success" => json!({
             "action": "complete",
@@ -1021,23 +1197,43 @@ fn next_action(state: &DepositState, status: &str) -> Value {
     }
 }
 
-pub fn gasless_deposit_status(source: &str, wallet: &str, id: &str) -> DispatchResponse {
-    gasless_deposit_status_with_host(&mut BloomHost, source, wallet, id)
+pub fn gasless_transaction_status(wallet: &str, id: &str) -> DispatchResponse {
+    gasless_transaction_status_with_host(&mut BloomHost, wallet, id)
 }
 
-fn gasless_deposit_status_with_host<H: Host>(
+fn gasless_transaction_status_with_host<H: Host>(
     host: &mut H,
-    source: &str,
     wallet: &str,
     id: &str,
 ) -> DispatchResponse {
-    let chain = match source_chain(source) {
-        Ok(chain) => chain,
-        Err(error) => return error,
-    };
-    let state = match load(host, chain, wallet, id) {
+    let state = match load(host, wallet, id) {
         Ok(Some(state)) => state,
-        Ok(None) => return petal::error(-1, "gasless deposit not found"),
+        Ok(None) => {
+            return petal::read_json_value(&json!({
+                "schema": "bloom.gasless.relay-transaction.v1",
+                "status": "not_created",
+                "wallet": wallet,
+                "id": id,
+                "write": {
+                    "origin": {
+                        "chain": "Relay chain slug",
+                        "chain_id": "positive Relay chain ID",
+                        "currency": "EIP-3009 EVM token address",
+                        "decimals": "0..38",
+                        "permit_domain": {"name": "EIP-712 domain name", "version": "EIP-712 domain version"}
+                    },
+                    "destination": {
+                        "chain": "Relay chain slug",
+                        "chain_id": "positive Relay chain ID",
+                        "currency": "Relay currency identifier",
+                        "decimals": "0..38",
+                        "recipient": "optional; defaults to the resolved wallet address"
+                    },
+                    "amount": "positive origin-token decimal",
+                    "minimum_output": "positive destination-token decimal"
+                }
+            }));
+        }
         Err(error) => return error,
     };
     let relay_status = if attempted_submission(&state.phase) {
@@ -1047,9 +1243,8 @@ fn gasless_deposit_status_with_host<H: Host>(
             &format!("/intents/status/v3?requestId={}", state.request_id),
             Vec::new(),
         ) {
-            Ok(value) => {
-                relay_status_projection(&value).or_else(|| Some(json!({"status": "unavailable"})))
-            }
+            Ok(value) => relay_status_projection(&state, &value)
+                .or_else(|| Some(json!({"status": "unavailable"}))),
             Err(DispatchResponse::Error { .. }) => Some(json!({"status": "unavailable"})),
             Err(_) => Some(json!({"status": "unavailable"})),
         }
@@ -1058,17 +1253,15 @@ fn gasless_deposit_status_with_host<H: Host>(
     };
     let now_ms = host.now_ms().unwrap_or(0);
     let local_phase = effective_local_phase(&state, now_ms);
-    let public_status = public_status(&local_phase, relay_status.as_ref());
-    let next = next_action(&state, &public_status);
+    let status = public_status(&local_phase, relay_status.as_ref());
+    let next = next_action(&state, &status);
     petal::read_json_value(&json!({
         "schema": state.schema,
-        "source_chain": state.source_chain,
-        "source_chain_id": chain.chain_id,
         "wallet": state.wallet,
         "address": state.address,
         "id": state.id,
-        "amount": state.amount,
-        "status": public_status,
+        "request": state.request,
+        "status": status,
         "request_id": state.request_id,
         "quote": state.quote,
         "approval": state.approval,
@@ -1084,6 +1277,9 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
 
     const WALLET: &str = "0x03508bb71268bba25ecacc8f620e01866650532c";
+    const RECIPIENT: &str = "0x1111111111111111111111111111111111111111";
+    const BASE_USDC: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+    const OPTIMISM_USDC: &str = "0x0b2c639c533813f4aa9d7837caf62653d097ff85";
 
     #[derive(Default)]
     struct MockHost {
@@ -1146,11 +1342,117 @@ mod tests {
         }
     }
 
-    fn request() -> GaslessDepositRequest {
-        GaslessDepositRequest {
+    fn request() -> RelayTransactionRequest {
+        RelayTransactionRequest {
+            origin: RelayOrigin {
+                chain: "base".into(),
+                chain_id: 8453,
+                currency: BASE_USDC.into(),
+                decimals: 6,
+                permit_domain: PermitDomain {
+                    name: "USD Coin".into(),
+                    version: "2".into(),
+                },
+            },
+            destination: RelayDestination {
+                chain: "optimism".into(),
+                chain_id: 10,
+                currency: OPTIMISM_USDC.into(),
+                decimals: 6,
+                recipient: None,
+            },
             amount: "100".into(),
-            minimum_output: "99".into(),
+            minimum_output: "97".into(),
         }
+    }
+
+    fn bound_request() -> (BoundRequest, String, String) {
+        bind_request(request(), WALLET).unwrap()
+    }
+
+    fn response() -> Value {
+        json!({
+            "steps":[{
+                "id":"authorize1",
+                "kind":"signature",
+                "requestId":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "items":[{
+                    "data":{
+                        "sign":{
+                            "signatureKind":"eip712",
+                            "types":{"ReceiveWithAuthorization":[
+                                {"name":"from","type":"address"},{"name":"to","type":"address"},
+                                {"name":"value","type":"uint256"},{"name":"validAfter","type":"uint256"},
+                                {"name":"validBefore","type":"uint256"},{"name":"nonce","type":"bytes32"}
+                            ]},
+                            "domain":{"name":"USD Coin","version":"2","chainId":8453,"verifyingContract":BASE_USDC},
+                            "primaryType":"ReceiveWithAuthorization",
+                            "value":{"from":WALLET,"to":RELAY_PERMIT_RECEIVER,"value":"100000000","validAfter":0,"validBefore":1999999999,"nonce":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+                        },
+                        "post":{"endpoint":"/execute/permits","method":"POST","body":{"kind":"eip3009","requestId":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","api":"swap"}}
+                    },
+                    "check":{"endpoint":"/intents/status/v3?requestId=0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","method":"GET"}
+                }]
+            }],
+            "details":{
+                "sender":WALLET,
+                "recipient":WALLET,
+                "currencyIn":{
+                    "currency":{"chainId":8453,"address":BASE_USDC,"decimals":6},
+                    "amount":"100000000",
+                    "amountFormatted":"100.0"
+                },
+                "currencyOut":{
+                    "currency":{"chainId":10,"address":OPTIMISM_USDC,"decimals":6},
+                    "amount":"98000000",
+                    "amountFormatted":"98.0",
+                    "minimumAmount":"97500000"
+                },
+                "refundCurrency":{
+                    "currency":{"chainId":8453,"address":BASE_USDC,"decimals":6},
+                    "amount":"100000000",
+                    "amountFormatted":"100.0",
+                    "minimumAmount":"100000000"
+                },
+                "totalImpact":{"percent":"-2.0"},
+                "expandedPriceImpact":{"execution":{"percent":"-1.0"}},
+                "timeEstimate":3
+            },
+            "protocol":{"v2":{"orderData":{
+                "inputs":[{
+                    "payment":{"chainId":"base","currency":BASE_USDC,"amount":"100000000"},
+                    "refunds":[
+                        {"chainId":"base","recipient":WALLET,"currency":BASE_USDC},
+                        {"chainId":"optimism","recipient":WALLET,"currency":OPTIMISM_USDC}
+                    ]
+                }],
+                "output":{
+                    "chainId":"optimism",
+                    "payments":[{
+                        "recipient":WALLET,
+                        "currency":OPTIMISM_USDC,
+                        "minimumAmount":"97500000",
+                        "expectedAmount":"98000000"
+                    }],
+                    "calls":[]
+                },
+                "fees":[]
+            }}}
+        })
+    }
+
+    fn prepare(value: Value) -> Result<RelayTransactionState, DispatchResponse> {
+        let (request, amount_units, minimum_output_units) = bound_request();
+        prepare_quote(
+            QuoteInput {
+                wallet: "minnow-passkey",
+                address: WALLET,
+                request: &request,
+                amount_units: &amount_units,
+                minimum_output_units: &minimum_output_units,
+            },
+            value,
+        )
     }
 
     fn approval() -> SignHashOutcome {
@@ -1167,268 +1469,271 @@ mod tests {
         SignHashOutcome::Signature(bytes)
     }
 
-    fn ethereum() -> SourceChain {
-        source_chain("ethereum").unwrap()
-    }
-
-    fn response(chain: SourceChain) -> Value {
-        json!({
-            "steps":[{
-                "id":"authorize1",
-                "kind":"signature",
-                "requestId":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "items":[{
-                    "data":{
-                        "sign":{
-                            "signatureKind":"eip712",
-                            "types":{"ReceiveWithAuthorization":[
-                                {"name":"from","type":"address"},{"name":"to","type":"address"},
-                                {"name":"value","type":"uint256"},{"name":"validAfter","type":"uint256"},
-                                {"name":"validBefore","type":"uint256"},{"name":"nonce","type":"bytes32"}
-                            ]},
-                            "domain":{"name":"USD Coin","version":"2","chainId":chain.chain_id,"verifyingContract":chain.usdc},
-                            "primaryType":"ReceiveWithAuthorization",
-                            "value":{"from":WALLET,"to":chain.permit_receiver,"value":"100000000","validAfter":0,"validBefore":1999999999,"nonce":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
-                        },
-                        "post":{"endpoint":"/execute/permits","method":"POST","body":{"kind":"eip3009","requestId":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","api":"swap"}}
-                    },
-                    "check":{"endpoint":"/intents/status/v3?requestId=0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
-                }]
-            }],
-            "details":{
-                "recipient":WALLET,
-                "currencyIn":{
-                    "currency":{"chainId":chain.chain_id,"address":chain.usdc,"decimals":chain.usdc_decimals},
-                    "amount":"100000000",
-                    "amountFormatted":"100.0"
-                },
-                "currencyOut":{
-                    "currency":{"chainId":1337,"address":HYPERLIQUID_USDC,"decimals":8},
-                    "amount":"9980000000",
-                    "amountFormatted":"99.8",
-                    "minimumAmount":"9930000000"
-                },
-                "refundCurrency":{
-                    "currency":{"chainId":chain.chain_id,"address":chain.usdc,"decimals":chain.usdc_decimals},
-                    "amount":"100000000",
-                    "amountFormatted":"100.0",
-                    "minimumAmount":"100000000"
-                },
-                "totalImpact":{"percent":"-0.2"},
-                "timeEstimate":3
-            },
-            "protocol":{
-                "v2":{
-                    "orderData":{
-                        "inputs":[{
-                            "refunds":[
-                                {"chainId":chain.slug,"recipient":WALLET,"currency":chain.usdc,"minimumAmount":"0"},
-                                {"chainId":"hyperliquid","recipient":WALLET,"currency":HYPERLIQUID_USDC,"minimumAmount":"0"}
-                            ]
-                        }]
-                    }
-                }
-            }
-        })
-    }
-
-    fn prepare_for(chain: SourceChain, response: Value) -> Result<DepositState, DispatchResponse> {
-        prepare_quote(
-            chain,
-            QuoteInput {
-                wallet: "minnow-passkey",
-                address: WALLET,
-                amount: "100",
-                units: "100000000",
-                minimum_output: "99",
-                minimum_output_units: "9900000000",
-            },
-            response,
-        )
-    }
-
-    fn prepare(response: Value) -> Result<DepositState, DispatchResponse> {
-        prepare_for(ethereum(), response)
+    #[test]
+    fn validates_and_hashes_a_generic_relay_route() {
+        let state = prepare(response()).unwrap();
+        assert_eq!(state.request.origin.chain, "base");
+        assert_eq!(state.request.destination.chain, "optimism");
+        assert_eq!(state.quote["required_minimum_out_units"], "97000000");
+        assert!(signing_hash(&state.sign).is_ok());
     }
 
     #[test]
-    fn accepts_only_the_expected_gasless_route_and_hashes_it() {
-        let state = prepare(response(ethereum())).unwrap();
-        assert_eq!(state.request_id.len(), 66);
-        assert_eq!(state.minimum_output.as_deref(), Some("99"));
-        assert_eq!(state.quote["required_minimum_out_units"], "9900000000");
+    fn supports_both_eip3009_authorization_primary_types() {
+        let mut transfer = response();
+        let fields =
+            transfer["steps"][0]["items"][0]["data"]["sign"]["types"]["ReceiveWithAuthorization"]
+                .take();
+        transfer["steps"][0]["items"][0]["data"]["sign"]["types"]["TransferWithAuthorization"] =
+            fields;
+        transfer["steps"][0]["items"][0]["data"]["sign"]["primaryType"] =
+            json!("TransferWithAuthorization");
+        assert!(prepare(transfer).is_ok());
+    }
+
+    #[test]
+    fn sends_the_exact_generic_quote_request() {
+        let (request, amount_units, minimum_output_units) = bound_request();
+        let mut host = MockHost::default();
+        host.push_json(200, response());
+        quote(
+            &mut host,
+            QuoteInput {
+                wallet: "minnow-passkey",
+                address: WALLET,
+                request: &request,
+                amount_units: &amount_units,
+                minimum_output_units: &minimum_output_units,
+            },
+        )
+        .unwrap();
+        let sent: Value = serde_json::from_slice(&host.requests[0].body).unwrap();
+        assert_eq!(sent["originChainId"], 8453);
+        assert_eq!(sent["destinationChainId"], 10);
+        assert_eq!(sent["originCurrency"], BASE_USDC);
+        assert_eq!(sent["destinationCurrency"], OPTIMISM_USDC);
+        assert_eq!(sent["recipient"], WALLET);
+        assert_eq!(sent["amount"], "100000000");
+        assert_eq!(sent["usePermit"], true);
+        assert_eq!(sent["forceSolverExecution"], true);
+    }
+
+    #[test]
+    fn binds_a_caller_selected_recipient_while_refunds_stay_with_the_wallet() {
+        let mut request = request();
+        request.destination.recipient = Some(RECIPIENT.into());
+        let (request, amount_units, minimum_output_units) = bind_request(request, WALLET).unwrap();
+        let mut value = response();
+        value["details"]["recipient"] = json!(RECIPIENT);
+        value["protocol"]["v2"]["orderData"]["output"]["payments"][0]["recipient"] =
+            json!(RECIPIENT);
+        let state = prepare_quote(
+            QuoteInput {
+                wallet: "minnow-passkey",
+                address: WALLET,
+                request: &request,
+                amount_units: &amount_units,
+                minimum_output_units: &minimum_output_units,
+            },
+            value,
+        )
+        .unwrap();
         assert_eq!(
-            format!("{:#x}", signing_hash(&state.sign).unwrap()),
-            "0xd58cc3c8271c0e82cff651c96d492dd2f0854cecd5e654b8c92bc378184b0fa6"
+            state.request.destination.recipient.as_deref(),
+            Some(RECIPIENT)
         );
     }
 
     #[test]
-    fn registry_pins_every_supported_native_usdc_contract() {
-        let expected = [
-            ("ethereum", 1, "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
-            ("base", 8453, "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
-            (
-                "arbitrum",
-                42161,
-                "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
-            ),
-            ("optimism", 10, "0x0b2c639c533813f4aa9d7837caf62653d097ff85"),
-            ("polygon", 137, "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"),
-            (
-                "avalanche",
-                43114,
-                "0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e",
-            ),
-        ];
-        assert_eq!(SOURCE_CHAINS.len(), expected.len());
-        for (slug, chain_id, usdc) in expected {
-            let chain = source_chain(slug).unwrap();
-            assert_eq!(chain.chain_id, chain_id);
-            assert_eq!(chain.usdc, usdc);
-            assert_eq!(chain.usdc_decimals, 6);
-            assert_eq!(chain.permit_receiver, RELAY_PERMIT_RECEIVER);
-        }
-        assert!(source_chain("Ethereum").is_err());
-        assert!(source_chain("solana").is_err());
-        assert!(source_chain("../ethereum").is_err());
-    }
-
-    #[test]
-    fn accepts_a_fully_pinned_quote_for_every_source_chain() {
-        for chain in SOURCE_CHAINS {
-            let state = prepare_for(chain, response(chain)).unwrap();
-            assert_eq!(state.source_chain, chain.slug);
-            assert_eq!(state.quote["source_chain"], chain.slug);
-            assert_eq!(state.quote["source_chain_id"], chain.chain_id);
-            assert_eq!(state.quote["source_currency"], chain.usdc);
-            assert!(signing_hash(&state.sign).is_ok());
-        }
-    }
-
-    #[test]
-    fn full_mock_lifecycle_reuses_one_quote_and_reconciles_success() {
-        let chain = source_chain("base").unwrap();
+    fn full_lifecycle_reuses_the_quote_and_reconciles_success() {
         let mut host = MockHost {
             now_ms: 1_000_000,
             ..MockHost::default()
         };
-        host.push_json(200, response(chain));
+        host.push_json(200, response());
         host.sign_results.push_back(Ok(approval()));
-
-        let first = gasless_deposit_with_host(
+        let first = gasless_transaction_with_host(
             &mut host,
-            chain.slug,
             "minnow-passkey".into(),
             WALLET.into(),
-            "lifecycle".into(),
+            "route-1".into(),
             request(),
         );
         assert!(matches!(first, DispatchResponse::Error { code: -2, .. }));
-        assert_eq!(host.requests.len(), 1);
-        assert_eq!(host.sign_requests.len(), 1);
-
-        let read =
-            gasless_deposit_status_with_host(&mut host, chain.slug, "minnow-passkey", "lifecycle");
-        let DispatchResponse::Read(bytes) = read else {
-            panic!("approval state must be readable");
-        };
-        let public: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(public["source_chain"], "base");
-        assert_eq!(public["status"], "approval_required");
 
         host.sign_results.push_back(Ok(signature()));
-        host.push_json(200, json!({"accepted": true}));
-        let retry = gasless_deposit_with_host(
+        host.push_json(200, json!({"accepted":true}));
+        let retry = gasless_transaction_with_host(
             &mut host,
-            chain.slug,
             "minnow-passkey".into(),
             WALLET.into(),
-            "lifecycle".into(),
+            "route-1".into(),
             request(),
         );
         assert_eq!(retry, DispatchResponse::Write);
-        assert_eq!(host.sign_requests.len(), 2);
-        assert_eq!(
-            host.sign_requests[0].hash32, host.sign_requests[1].hash32,
-            "approval retry must sign the exact persisted quote"
-        );
+        assert_eq!(host.sign_requests[0].purpose, "gasless.relay");
+        assert_eq!(host.sign_requests[0].hash32, host.sign_requests[1].hash32);
         assert_eq!(
             host.requests
                 .iter()
                 .filter(|request| request.url.ends_with("/quote/v2"))
                 .count(),
-            1,
-            "approval retry must not request a second quote"
+            1
         );
 
         host.push_json(
             200,
             json!({
-                "status": "success",
-                "originChainId": chain.chain_id,
-                "destinationChainId": 1337,
-                "inTxHashes": ["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
-                "txHashes": ["0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+                "status":"success",
+                "originChainId":8453,
+                "destinationChainId":10,
+                "txHashes":["0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"]
             }),
         );
-        let settled =
-            gasless_deposit_status_with_host(&mut host, chain.slug, "minnow-passkey", "lifecycle");
-        let DispatchResponse::Read(bytes) = settled else {
-            panic!("submitted operation must be readable");
+        let status = gasless_transaction_status_with_host(&mut host, "minnow-passkey", "route-1");
+        let DispatchResponse::Read(bytes) = status else {
+            panic!("submitted transaction must remain readable");
         };
         let public: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(public["status"], "success");
         assert_eq!(public["next"]["action"], "complete");
 
-        let stored = host
-            .store
-            .get(&key(chain, "minnow-passkey", "lifecycle"))
-            .unwrap();
-        let stored_text = String::from_utf8_lossy(stored);
-        assert!(!stored_text.contains(&"ab".repeat(64)));
-        assert!(!stored_text.contains("signature="));
+        let stored = host.store.get(&key("minnow-passkey", "route-1")).unwrap();
+        let stored = String::from_utf8_lossy(stored);
+        assert!(!stored.contains(&"ab".repeat(64)));
+        assert!(!stored.contains("signature="));
     }
 
     #[test]
-    fn ambiguous_mock_submission_never_leaks_signature_and_reads_reconcile_it() {
-        let chain = source_chain("optimism").unwrap();
+    fn rejects_every_material_quote_or_order_substitution() {
+        type QuoteMutation = Box<dyn Fn(&mut Value)>;
+        let mutations: Vec<QuoteMutation> = vec![
+            Box::new(|value| {
+                value["steps"][0]["items"][0]["data"]["sign"]["domain"]["verifyingContract"] =
+                    json!("0x0000000000000000000000000000000000000002")
+            }),
+            Box::new(|value| {
+                value["steps"][0]["items"][0]["data"]["sign"]["value"]["to"] =
+                    json!("0x0000000000000000000000000000000000000002")
+            }),
+            Box::new(|value| value["details"]["currencyOut"]["currency"]["chainId"] = json!(42161)),
+            Box::new(|value| {
+                value["details"]["currencyOut"]["currency"]["address"] =
+                    json!("0x0000000000000000000000000000000000000002")
+            }),
+            Box::new(|value| {
+                value["details"]["recipient"] = json!("0x0000000000000000000000000000000000000002")
+            }),
+            Box::new(|value| {
+                value["protocol"]["v2"]["orderData"]["inputs"][0]["payment"]["amount"] =
+                    json!("99999999")
+            }),
+            Box::new(|value| {
+                value["protocol"]["v2"]["orderData"]["inputs"][0]["refunds"][1]["recipient"] =
+                    json!("0x0000000000000000000000000000000000000002")
+            }),
+            Box::new(|value| {
+                value["protocol"]["v2"]["orderData"]["output"]["payments"][0]["currency"] =
+                    json!("0x0000000000000000000000000000000000000002")
+            }),
+            Box::new(|value| {
+                value["protocol"]["v2"]["orderData"]["output"]["calls"] =
+                    json!([{"to":"0x0000000000000000000000000000000000000002"}])
+            }),
+            Box::new(|value| {
+                value["protocol"]["v2"]["orderData"]["fees"] = json!([{"amount":"1"}])
+            }),
+        ];
+        for mutate in mutations {
+            let mut value = response();
+            mutate(&mut value);
+            assert!(prepare(value).is_err());
+        }
+    }
+
+    #[test]
+    fn enforces_the_callers_output_floor_and_request_idempotency() {
+        let mut below_floor = response();
+        below_floor["details"]["currencyOut"]["minimumAmount"] = json!("96999999");
+        below_floor["protocol"]["v2"]["orderData"]["output"]["payments"][0]["minimumAmount"] =
+            json!("96999999");
+        assert!(prepare(below_floor).is_err());
+
         let mut host = MockHost {
             now_ms: 1_000_000,
             ..MockHost::default()
         };
-        host.push_json(200, response(chain));
+        host.push_json(200, response());
+        host.sign_results.push_back(Ok(approval()));
+        let _ = gasless_transaction_with_host(
+            &mut host,
+            "minnow-passkey".into(),
+            WALLET.into(),
+            "stable-id".into(),
+            request(),
+        );
+        let mut changed = request();
+        changed.destination.chain_id = 42161;
+        let reused = gasless_transaction_with_host(
+            &mut host,
+            "minnow-passkey".into(),
+            WALLET.into(),
+            "stable-id".into(),
+            changed,
+        );
+        assert!(matches!(reused, DispatchResponse::Error { code: -3, .. }));
+        assert_eq!(host.requests.len(), 1);
+    }
+
+    #[test]
+    fn validates_generic_request_fields_before_http_or_signing() {
+        assert!(decimal_units("1.0000001", 6, "amount").is_err());
+        assert_eq!(decimal_units("12.5", 6, "amount").unwrap(), "12500000");
+        assert_eq!(decimal_units("12", 0, "amount").unwrap(), "12");
+        assert_eq!(format_units(93_027_000, 8), "0.93027");
+
+        let mut bad = request();
+        bad.origin.currency = "USDC".into();
+        assert!(bind_request(bad, WALLET).is_err());
+        let mut bad = request();
+        bad.origin.chain = "../base".into();
+        assert!(bind_request(bad, WALLET).is_err());
+        let mut bad = request();
+        bad.destination.currency = "bad currency".into();
+        assert!(bind_request(bad, WALLET).is_err());
+        let mut bad = request();
+        bad.destination.decimals = 39;
+        assert!(bind_request(bad, WALLET).is_err());
+    }
+
+    #[test]
+    fn ambiguous_submission_is_opaque_and_remains_reconcilable() {
+        let mut host = MockHost {
+            now_ms: 1_000_000,
+            ..MockHost::default()
+        };
+        host.push_json(200, response());
         host.sign_results.push_back(Ok(signature()));
         host.http_results
             .push_back(Err("transport failed at ?signature=0xsecret".into()));
-
-        let result = gasless_deposit_with_host(
+        let result = gasless_transaction_with_host(
             &mut host,
-            chain.slug,
             "minnow-passkey".into(),
             WALLET.into(),
             "ambiguous".into(),
             request(),
         );
         assert_eq!(result, backend(SUBMISSION_UNKNOWN));
-        let stored = host
-            .store
-            .get(&key(chain, "minnow-passkey", "ambiguous"))
-            .unwrap();
-        let stored_text = String::from_utf8_lossy(stored);
-        assert!(!stored_text.contains("0xsecret"));
-        assert!(!stored_text.contains("transport failed"));
+        let stored = host.store.get(&key("minnow-passkey", "ambiguous")).unwrap();
+        let stored = String::from_utf8_lossy(stored);
+        assert!(!stored.contains("secret"));
+        assert!(!stored.contains("transport failed"));
 
         host.push_json(
             200,
-            json!({
-                "status": "success",
-                "originChainId": chain.chain_id,
-                "destinationChainId": 1337
-            }),
+            json!({"status":"success","originChainId":8453,"destinationChainId":10}),
         );
-        let status =
-            gasless_deposit_status_with_host(&mut host, chain.slug, "minnow-passkey", "ambiguous");
+        let status = gasless_transaction_status_with_host(&mut host, "minnow-passkey", "ambiguous");
         let DispatchResponse::Read(bytes) = status else {
             panic!("ambiguous submission must be readable");
         };
@@ -1437,344 +1742,14 @@ mod tests {
     }
 
     #[test]
-    fn same_wallet_and_id_are_isolated_across_mock_source_chains() {
-        let base = source_chain("base").unwrap();
-        let arbitrum = source_chain("arbitrum").unwrap();
-        let mut host = MockHost {
-            now_ms: 1_000_000,
-            ..MockHost::default()
-        };
-        host.push_json(200, response(base));
-        host.push_json(200, response(arbitrum));
-        host.sign_results.push_back(Ok(approval()));
-        host.sign_results.push_back(Ok(approval()));
-
-        for chain in [base, arbitrum] {
-            let result = gasless_deposit_with_host(
-                &mut host,
-                chain.slug,
-                "minnow-passkey".into(),
-                WALLET.into(),
-                "same-id".into(),
-                request(),
-            );
-            assert!(matches!(result, DispatchResponse::Error { code: -2, .. }));
-        }
-        assert!(
-            host.store
-                .contains_key(&key(base, "minnow-passkey", "same-id"))
-        );
-        assert!(
-            host.store
-                .contains_key(&key(arbitrum, "minnow-passkey", "same-id"))
-        );
-        assert_ne!(
-            key(base, "minnow-passkey", "same-id"),
-            key(arbitrum, "minnow-passkey", "same-id")
-        );
-    }
-
-    #[test]
-    fn rejects_chain_token_receiver_and_input_metadata_substitution_on_every_chain() {
-        for chain in SOURCE_CHAINS {
-            let mut wrong_domain_chain = response(chain);
-            wrong_domain_chain["steps"][0]["items"][0]["data"]["sign"]["domain"]["chainId"] =
-                json!(chain.chain_id + 1);
-            assert!(prepare_for(chain, wrong_domain_chain).is_err());
-
-            let mut wrong_contract = response(chain);
-            wrong_contract["steps"][0]["items"][0]["data"]["sign"]["domain"]["verifyingContract"] =
-                Value::String("0x0000000000000000000000000000000000000002".into());
-            assert!(prepare_for(chain, wrong_contract).is_err());
-
-            let mut wrong_receiver = response(chain);
-            wrong_receiver["steps"][0]["items"][0]["data"]["sign"]["value"]["to"] =
-                Value::String("0x0000000000000000000000000000000000000002".into());
-            assert!(prepare_for(chain, wrong_receiver).is_err());
-
-            let mut wrong_detail_chain = response(chain);
-            wrong_detail_chain["details"]["currencyIn"]["currency"]["chainId"] =
-                json!(chain.chain_id + 1);
-            assert!(prepare_for(chain, wrong_detail_chain).is_err());
-
-            let mut wrong_detail_token = response(chain);
-            wrong_detail_token["details"]["currencyIn"]["currency"]["address"] =
-                Value::String("0x0000000000000000000000000000000000000002".into());
-            assert!(prepare_for(chain, wrong_detail_token).is_err());
-
-            let mut wrong_refund_recipient = response(chain);
-            wrong_refund_recipient["protocol"]["v2"]["orderData"]["inputs"][0]["refunds"][0]["recipient"] =
-                Value::String("0x0000000000000000000000000000000000000002".into());
-            assert!(prepare_for(chain, wrong_refund_recipient).is_err());
-
-            let mut extra_refund = response(chain);
-            extra_refund["protocol"]["v2"]["orderData"]["inputs"][0]["refunds"]
-                .as_array_mut()
-                .unwrap()
-                .push(json!({
-                    "chainId": chain.slug,
-                    "recipient": WALLET,
-                    "currency": chain.usdc
-                }));
-            assert!(prepare_for(chain, extra_refund).is_err());
-        }
-    }
-
-    #[test]
-    fn durable_keys_are_chain_scoped_and_ethereum_routes_share_legacy_state() {
-        let wallet = "minnow-passkey";
-        let id = "same-id";
-        let ethereum_key = key(ethereum(), wallet, id);
-        assert_eq!(
-            ethereum_key,
-            "state/gasless-deposits/minnow-passkey/same-id.json"
-        );
-        assert_eq!(
-            key(source_chain("base").unwrap(), wallet, id),
-            "state/gasless-deposits/by-chain/base/minnow-passkey/same-id.json"
-        );
-        for left in SOURCE_CHAINS {
-            for right in SOURCE_CHAINS {
-                if left != right {
-                    assert_ne!(key(left, wallet, id), key(right, wallet, id));
-                }
-            }
-        }
-
-        let mut old_value = serde_json::to_value(prepare(response(ethereum())).unwrap()).unwrap();
-        old_value.as_object_mut().unwrap().remove("source_chain");
-        let old_state: DepositState = serde_json::from_value(old_value).unwrap();
-        assert_eq!(old_state.source_chain, "ethereum");
-    }
-
-    #[test]
-    fn concurrent_initialization_loser_adopts_the_atomically_persisted_winner() {
-        let mut losing_quote = prepare(response(ethereum())).unwrap();
-        losing_quote.request_id =
-            "0x1111111111111111111111111111111111111111111111111111111111111111".into();
-        let mut winning_quote = prepare(response(ethereum())).unwrap();
-        winning_quote.request_id =
-            "0x2222222222222222222222222222222222222222222222222222222222222222".into();
-
-        let selected =
-            resolve_initialization_conflict(Some(winning_quote), WALLET, "100000000", "9900000000")
-                .unwrap();
-        assert_eq!(
-            selected.request_id,
-            "0x2222222222222222222222222222222222222222222222222222222222222222"
-        );
-        assert_ne!(selected.request_id, losing_quote.request_id);
-
-        let mut incompatible_winner = selected;
-        incompatible_winner.minimum_output_units = Some("9910000000".into());
-        assert!(
-            resolve_initialization_conflict(
-                Some(incompatible_winner),
-                WALLET,
-                "100000000",
-                "9900000000"
-            )
-            .is_err()
-        );
-        assert!(resolve_initialization_conflict(None, WALLET, "100000000", "9900000000").is_err());
-
-        let winner = prepare(response(ethereum())).unwrap();
-        assert!(
-            resolve_initialization_conflict(
-                Some(winner),
-                "0x0000000000000000000000000000000000000002",
-                "100000000",
-                "9900000000"
-            )
-            .is_err(),
-            "a wallet alias that resolves to a new address must not reuse old signing state"
-        );
-    }
-
-    #[test]
-    fn rejects_quote_redirection_and_bad_amounts() {
-        let mut redirected = response(ethereum());
-        redirected["details"]["recipient"] =
-            Value::String("0x0000000000000000000000000000000000000002".into());
-        assert!(prepare(redirected).is_err());
-
-        let mut injected_request_id = response(ethereum());
-        injected_request_id["steps"][0]["requestId"] =
-            Value::String("request&signature=0xsecret".into());
-        injected_request_id["steps"][0]["items"][0]["data"]["post"]["body"]["requestId"] =
-            Value::String("request&signature=0xsecret".into());
-        assert!(prepare(injected_request_id).is_err());
-
-        assert!(decimal_units("1.0000001", 6, "amount").is_err());
-        assert_eq!(decimal_units("12.5", 6, "amount").unwrap(), "12500000");
-        assert_eq!(
-            decimal_units("0.934945", HYPERCORE_USDC_DECIMALS, "minimum_output").unwrap(),
-            "93494500"
-        );
-        assert_eq!(format_units(93_027_000, HYPERCORE_USDC_DECIMALS), "0.93027");
-    }
-
-    #[test]
-    fn rejects_an_untrusted_eip3009_receiver() {
-        let mut redirected = response(ethereum());
-        redirected["steps"][0]["items"][0]["data"]["sign"]["value"]["to"] =
-            Value::String("0x0000000000000000000000000000000000000002".into());
-        assert!(prepare(redirected).is_err());
-    }
-
-    #[test]
-    fn enforces_the_callers_minimum_output_against_relays_slippage_floor() {
-        let rejected = prepare_quote(
-            ethereum(),
-            QuoteInput {
-                wallet: "minnow-passkey",
-                address: WALLET,
-                amount: "100",
-                units: "100000000",
-                minimum_output: "99.4",
-                minimum_output_units: "9940000000",
-            },
-            response(ethereum()),
-        );
-        assert!(rejected.is_err());
-
-        let mut inflated_floor = response(ethereum());
-        inflated_floor["details"]["currencyOut"]["minimumAmount"] =
-            Value::String("9990000000".into());
-        inflated_floor["details"]["currencyOut"]["amount"] = Value::String("9980000000".into());
-        assert!(prepare(inflated_floor).is_err());
-    }
-
-    #[test]
-    fn rejects_quote_amount_or_output_precision_changes() {
-        let mut changed_input = response(ethereum());
-        changed_input["details"]["currencyIn"]["amount"] = Value::String("99999999".into());
-        assert!(prepare(changed_input).is_err());
-
-        let mut changed_decimals = response(ethereum());
-        changed_decimals["details"]["currencyOut"]["currency"]["decimals"] = json!(6);
-        assert!(prepare(changed_decimals).is_err());
-    }
-
-    #[test]
-    fn rejects_invalid_eip3009_validity_windows() {
-        let mut invalid_window = response(ethereum());
-        invalid_window["steps"][0]["items"][0]["data"]["sign"]["value"]["validAfter"] =
-            json!(2_000_000_000_u64);
-        assert!(prepare(invalid_window).is_err());
-    }
-
-    #[test]
-    fn approval_projection_is_self_documenting_and_retriable() {
-        let state = prepare(response(ethereum())).unwrap();
-        assert_eq!(
-            retry_write_body(&state),
-            json!({"amount":"100","minimum_output":"99"})
-        );
-        let next = next_action(&state, "approval_required");
-        assert_eq!(next["action"], "review_quote_then_approve");
-        assert_eq!(
-            next["retry_write_body"],
-            json!({"amount":"100","minimum_output":"99"})
-        );
-    }
-
-    #[test]
-    fn distinguishes_retryable_ceremony_expiry_from_quote_expiry() {
-        let mut state = prepare(response(ethereum())).unwrap();
-        state.phase = "approval_required".into();
-        state.approval = Some(json!({"expires_ms": 2_000_u64}));
-        assert_eq!(effective_local_phase(&state, 2_001), "approval_expired");
-        assert_eq!(
-            next_action(&state, "approval_expired")["action"],
-            "retry_write"
-        );
-
-        let quote_deadline_ms = (1_999_999_999_u64 - PERMIT_SUBMISSION_MARGIN_SECONDS) * 1_000;
-        assert_eq!(
-            effective_local_phase(&state, quote_deadline_ms),
-            "quote_expired"
-        );
-        assert_eq!(
-            next_action(&state, "quote_expired")["action"],
-            "create_new_deposit"
-        );
-
+    fn status_rejects_a_mismatched_relay_operation() {
+        let mut state = prepare(response()).unwrap();
+        state.id = "status".into();
         state.phase = "submitted".into();
-        assert_eq!(
-            effective_local_phase(&state, quote_deadline_ms),
-            "submitted"
+        let projected = relay_status_projection(
+            &state,
+            &json!({"status":"success","originChainId":1,"destinationChainId":10}),
         );
-    }
-
-    #[test]
-    fn legacy_unbounded_quotes_fail_closed_without_blocking_reconciliation() {
-        let mut state = prepare(response(ethereum())).unwrap();
-        state.minimum_output = None;
-        state.minimum_output_units = None;
-        assert_eq!(effective_local_phase(&state, 1), "quote_unbounded");
-        assert_eq!(
-            next_action(&state, "quote_unbounded")["action"],
-            "create_new_deposit"
-        );
-
-        state.phase = "submission_unknown".into();
-        assert_eq!(
-            effective_local_phase(&state, 1),
-            "submission_unknown",
-            "attempted legacy submissions must still reconcile through reads"
-        );
-    }
-
-    #[test]
-    fn reconciles_every_phase_that_may_have_reached_relay() {
-        for phase in [
-            "submitting",
-            "submission_unknown",
-            "submission_failed",
-            "submitted",
-        ] {
-            assert!(attempted_submission(phase));
-        }
-        assert!(!attempted_submission("approval_required"));
-
-        let relay_success = json!({"status": "success"});
-        assert_eq!(
-            public_status("submission_unknown", Some(&relay_success)),
-            "success"
-        );
-        assert_eq!(
-            public_status("submission_failed", Some(&json!({"status": "unavailable"}))),
-            "submission_unknown"
-        );
-    }
-
-    #[test]
-    fn projects_only_non_secret_relay_status_fields() {
-        let projected = relay_status_projection(&json!({
-            "status": "success",
-            "signature": "0xsecret",
-            "message": "signature=0xsecret",
-            "inTxHashes": [
-                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "not-a-hash"
-            ],
-            "txHashes": ["0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
-            "updatedAt": 123,
-            "originChainId": 1,
-            "destinationChainId": 1337
-        }))
-        .unwrap();
-        let encoded = serde_json::to_string(&projected).unwrap();
-        assert!(!encoded.contains("secret"));
-        assert!(!encoded.contains("signature"));
-        assert!(!encoded.contains("not-a-hash"));
-    }
-
-    #[test]
-    fn permit_submission_errors_are_always_opaque() {
-        assert!(!SUBMISSION_UNKNOWN.contains("signature"));
-        assert!(!SUBMISSION_UNKNOWN.contains("http"));
-        assert!(!SUBMISSION_UNKNOWN.contains("api.relay.link"));
+        assert!(projected.is_none());
     }
 }
