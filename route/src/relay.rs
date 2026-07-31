@@ -8,6 +8,7 @@ use petal::{
 };
 
 const RELAY: &str = "https://api.relay.link";
+const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 // Relay v3 ApprovalProxy. Every permit quote must independently prove that the
 // authorization is addressed to this receiver before Bloom asks the owner to
 // sign it.
@@ -376,13 +377,26 @@ fn bind_request(
         "origin.permit_domain.version",
     )?;
 
+    let origin_currency = normalize_evm_address(&request.origin.currency, "origin.currency")?;
+    if origin_currency == ZERO_ADDRESS {
+        return Err(invalid(
+            "origin.currency must be an EIP-3009 token contract, not a native currency",
+        ));
+    }
     let origin = RelayOrigin {
         chain: normalize_chain(&request.origin.chain, "origin.chain")?,
         chain_id: request.origin.chain_id,
-        currency: normalize_evm_address(&request.origin.currency, "origin.currency")?,
+        currency: origin_currency,
         decimals: request.origin.decimals,
         permit_domain: request.origin.permit_domain,
     };
+    let recipient = match request.destination.recipient {
+        Some(recipient) => normalize_relay_identifier(&recipient, "destination.recipient")?,
+        None => wallet_address.to_ascii_lowercase(),
+    };
+    if recipient == ZERO_ADDRESS {
+        return Err(invalid("destination.recipient cannot be the zero address"));
+    }
     let destination = RelayDestination {
         chain: normalize_chain(&request.destination.chain, "destination.chain")?,
         chain_id: request.destination.chain_id,
@@ -391,10 +405,7 @@ fn bind_request(
             "destination.currency",
         )?,
         decimals: request.destination.decimals,
-        recipient: Some(match request.destination.recipient {
-            Some(recipient) => normalize_relay_identifier(&recipient, "destination.recipient")?,
-            None => wallet_address.to_ascii_lowercase(),
-        }),
+        recipient: Some(recipient),
     };
     let amount_units =
         decimal_units(&request.amount, origin.decimals, "amount").map_err(invalid)?;
@@ -766,6 +777,12 @@ fn validate_order(
     {
         return Err(backend("Relay returned unexpected application fees"));
     }
+    if response.pointer("/fees/app").is_some_and(|app_fee| {
+        app_fee.get("amount").and_then(Value::as_str) != Some("0")
+            || app_fee.get("minimumAmount").and_then(Value::as_str) != Some("0")
+    }) {
+        return Err(backend("Relay returned an unexpected application fee"));
+    }
     Ok(())
 }
 
@@ -1090,12 +1107,13 @@ fn relay_status_projection(state: &RelayTransactionState, value: &Value) -> Opti
     ) {
         return None;
     }
-    if value
-        .get("originChainId")
-        .is_some_and(|value| uint64_value(Some(value)) != Some(state.request.origin.chain_id))
-        || value.get("destinationChainId").is_some_and(|value| {
-            uint64_value(Some(value)) != Some(state.request.destination.chain_id)
-        })
+    let origin_chain_id = uint64_value(value.get("originChainId"));
+    let destination_chain_id = uint64_value(value.get("destinationChainId"));
+    if origin_chain_id.is_some_and(|chain_id| chain_id != state.request.origin.chain_id)
+        || destination_chain_id
+            .is_some_and(|chain_id| chain_id != state.request.destination.chain_id)
+        || (matches!(status, "success" | "refund" | "failure")
+            && (origin_chain_id.is_none() || destination_chain_id.is_none()))
     {
         return None;
     }
@@ -1118,8 +1136,8 @@ fn relay_status_projection(state: &RelayTransactionState, value: &Value) -> Opti
         "in_tx_hashes": valid_hashes("inTxHashes"),
         "tx_hashes": valid_hashes("txHashes"),
         "updated_at": value.get("updatedAt").and_then(Value::as_u64),
-        "origin_chain_id": value.get("originChainId").and_then(Value::as_u64),
-        "destination_chain_id": value.get("destinationChainId").and_then(Value::as_u64)
+        "origin_chain_id": origin_chain_id,
+        "destination_chain_id": destination_chain_id
     }))
 }
 
@@ -1418,6 +1436,9 @@ mod tests {
                 "expandedPriceImpact":{"execution":{"percent":"-1.0"}},
                 "timeEstimate":3
             },
+            "fees":{
+                "app":{"amount":"0","minimumAmount":"0"}
+            },
             "protocol":{"v2":{"orderData":{
                 "inputs":[{
                     "payment":{"chainId":"base","currency":BASE_USDC,"amount":"100000000"},
@@ -1652,6 +1673,18 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_top_level_application_fee_even_when_order_fees_are_empty() {
+        let mut value = response();
+        value["fees"] = json!({
+            "app": {
+                "amount": "1",
+                "minimumAmount": "1"
+            }
+        });
+        assert!(prepare(value).is_err());
+    }
+
+    #[test]
     fn enforces_the_callers_output_floor_and_request_idempotency() {
         let mut below_floor = response();
         below_floor["details"]["currencyOut"]["minimumAmount"] = json!("96999999");
@@ -1695,6 +1728,13 @@ mod tests {
         let mut bad = request();
         bad.origin.currency = "USDC".into();
         assert!(bind_request(bad, WALLET).is_err());
+        let mut native = request();
+        native.origin.currency = "0x0000000000000000000000000000000000000000".into();
+        assert!(bind_request(native, WALLET).is_err());
+        let mut zero_recipient = request();
+        zero_recipient.destination.recipient =
+            Some("0x0000000000000000000000000000000000000000".into());
+        assert!(bind_request(zero_recipient, WALLET).is_err());
         let mut bad = request();
         bad.origin.chain = "../base".into();
         assert!(bind_request(bad, WALLET).is_err());
@@ -1751,5 +1791,45 @@ mod tests {
             &json!({"status":"success","originChainId":1,"destinationChainId":10}),
         );
         assert!(projected.is_none());
+    }
+
+    #[test]
+    fn status_requires_both_chain_ids_before_reporting_a_terminal_outcome() {
+        let mut state = prepare(response()).unwrap();
+        state.id = "status".into();
+        state.phase = "submitted".into();
+
+        for status in ["success", "refund", "failure"] {
+            assert!(
+                relay_status_projection(&state, &json!({"status":status,"destinationChainId":10}))
+                    .is_none()
+            );
+            assert!(
+                relay_status_projection(&state, &json!({"status":status,"originChainId":8453}))
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn status_accepts_idless_waiting_but_rejects_any_supplied_mismatch() {
+        let mut state = prepare(response()).unwrap();
+        state.id = "status".into();
+        state.phase = "submitted".into();
+
+        assert!(
+            relay_status_projection(
+                &state,
+                &json!({"status":"waiting","quoteCreatedAt":1_785_467_680_898_u64})
+            )
+            .is_some()
+        );
+        assert!(
+            relay_status_projection(
+                &state,
+                &json!({"status":"waiting","originChainId":1,"destinationChainId":10})
+            )
+            .is_none()
+        );
     }
 }

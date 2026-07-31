@@ -10,6 +10,7 @@ use petal::{
 };
 
 const RELAY: &str = "https://api.relay.link";
+const HYPERCORE_CHAIN_ID: u64 = 1337;
 const HYPERLIQUID_USDC: &str = "0x00000000000000000000000000000000";
 // Relay v3 ApprovalProxy. Live quotes currently use the same receiver on every
 // supported source, but the receiver remains part of each registry entry so a
@@ -903,7 +904,7 @@ fn attempted_submission(phase: &str) -> bool {
     )
 }
 
-fn relay_status_projection(value: &Value) -> Option<Value> {
+fn relay_status_projection(chain: SourceChain, value: &Value) -> Option<Value> {
     let status = value.get("status").and_then(Value::as_str)?;
     if !matches!(
         status,
@@ -916,6 +917,15 @@ fn relay_status_projection(value: &Value) -> Option<Value> {
             | "refund"
             | "failure"
     ) {
+        return None;
+    }
+    let origin_chain_id = uint64_value(value.get("originChainId"));
+    let destination_chain_id = uint64_value(value.get("destinationChainId"));
+    if origin_chain_id.is_some_and(|chain_id| chain_id != chain.chain_id)
+        || destination_chain_id.is_some_and(|chain_id| chain_id != HYPERCORE_CHAIN_ID)
+        || (matches!(status, "success" | "refund" | "failure")
+            && (origin_chain_id.is_none() || destination_chain_id.is_none()))
+    {
         return None;
     }
     let valid_hashes = |field: &str| {
@@ -937,8 +947,8 @@ fn relay_status_projection(value: &Value) -> Option<Value> {
         "in_tx_hashes": valid_hashes("inTxHashes"),
         "tx_hashes": valid_hashes("txHashes"),
         "updated_at": value.get("updatedAt").and_then(Value::as_u64),
-        "origin_chain_id": value.get("originChainId").and_then(Value::as_u64),
-        "destination_chain_id": value.get("destinationChainId").and_then(Value::as_u64)
+        "origin_chain_id": origin_chain_id,
+        "destination_chain_id": destination_chain_id
     }))
 }
 
@@ -1049,9 +1059,8 @@ fn gasless_deposit_status_with_host<H: Host>(
             &format!("/intents/status/v3?requestId={}", state.request_id),
             Vec::new(),
         ) {
-            Ok(value) => {
-                relay_status_projection(&value).or_else(|| Some(json!({"status": "unavailable"})))
-            }
+            Ok(value) => relay_status_projection(chain, &value)
+                .or_else(|| Some(json!({"status": "unavailable"}))),
             Err(DispatchResponse::Error { .. }) => Some(json!({"status": "unavailable"})),
             Err(_) => Some(json!({"status": "unavailable"})),
         }
@@ -1753,24 +1762,63 @@ mod tests {
 
     #[test]
     fn projects_only_non_secret_relay_status_fields() {
-        let projected = relay_status_projection(&json!({
-            "status": "success",
-            "signature": "0xsecret",
-            "message": "signature=0xsecret",
-            "inTxHashes": [
-                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "not-a-hash"
-            ],
-            "txHashes": ["0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
-            "updatedAt": 123,
-            "originChainId": 1,
-            "destinationChainId": 1337
-        }))
+        let projected = relay_status_projection(
+            ethereum(),
+            &json!({
+                "status": "success",
+                "signature": "0xsecret",
+                "message": "signature=0xsecret",
+                "inTxHashes": [
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "not-a-hash"
+                ],
+                "txHashes": ["0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+                "updatedAt": 123,
+                "originChainId": 1,
+                "destinationChainId": 1337
+            }),
+        )
         .unwrap();
         let encoded = serde_json::to_string(&projected).unwrap();
         assert!(!encoded.contains("secret"));
         assert!(!encoded.contains("signature"));
         assert!(!encoded.contains("not-a-hash"));
+    }
+
+    #[test]
+    fn legacy_status_rejects_missing_or_mismatched_chain_ids() {
+        for status in ["success", "refund", "failure"] {
+            assert!(
+                relay_status_projection(
+                    ethereum(),
+                    &json!({
+                        "status": status,
+                        "originChainId": 8453,
+                        "destinationChainId": 1337
+                    })
+                )
+                .is_none()
+            );
+            assert!(relay_status_projection(ethereum(), &json!({"status": status})).is_none());
+        }
+    }
+
+    #[test]
+    fn legacy_status_accepts_idless_waiting_but_rejects_any_supplied_mismatch() {
+        assert!(
+            relay_status_projection(
+                ethereum(),
+                &json!({"status":"waiting","quoteCreatedAt":1_785_467_680_898_u64})
+            )
+            .is_some()
+        );
+        assert!(
+            relay_status_projection(
+                ethereum(),
+                &json!({"status":"waiting","originChainId":8453,"destinationChainId":1337})
+            )
+            .is_none()
+        );
     }
 
     #[test]
