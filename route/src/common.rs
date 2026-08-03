@@ -1,5 +1,4 @@
-//! Shared Relay protocol constants, host abstraction, and utilities used by
-//! both the generic transaction module and the legacy deposit module.
+//! Shared Relay protocol constants, host abstraction, and utilities.
 
 use alloy_dyn_abi::eip712::TypedData;
 use alloy_primitives::B256;
@@ -19,8 +18,8 @@ pub(crate) const MAX_BODY: usize = 512 * 1024;
 pub(crate) const MAX_DECIMALS: u8 = 38;
 pub(crate) const PERMIT_SUBMISSION_MARGIN_SECONDS: u64 = 30;
 
-/// Host trait abstracting store, HTTP, signing, and time so that both modules
-/// share a single production implementation and test mocks.
+/// Host trait abstracting store, HTTP, signing, and time so that the module
+/// shares a single production implementation and test mocks.
 pub(crate) trait Host {
     fn store_get(&mut self, key: &str, max_bytes: usize) -> Result<Option<Vec<u8>>, String>;
     fn store_put(&mut self, key: &str, value: &[u8]) -> Result<(), String>;
@@ -231,51 +230,6 @@ pub(crate) fn signing_hash(sign: &Value) -> Result<B256, DispatchResponse> {
     typed
         .eip712_signing_hash()
         .map_err(|error| backend(format!("cannot hash Relay typed data: {error}")))
-}
-
-// ---------------------------------------------------------------------------
-// Order safety validation — shared between both modules
-// ---------------------------------------------------------------------------
-
-/// Validates that the Relay response contains no hidden destination calls,
-/// no order-level fees, and no top-level application fees. This is the
-/// critical security check that prevents a compromised Relay response from
-/// injecting arbitrary execution or skimming funds.
-pub(crate) fn validate_order_safety(response: &Value) -> Result<(), DispatchResponse> {
-    let order = response.pointer("/protocol/v2/orderData");
-
-    if let Some(order) = order {
-        // Reject destination calls — this is a transfer-only route.
-        let has_dest_calls = order
-            .get("output")
-            .and_then(|output| output.get("calls"))
-            .and_then(Value::as_array)
-            .is_some_and(|calls| !calls.is_empty());
-        if has_dest_calls {
-            return Err(backend(
-                "Relay returned destination calls for a transfer-only route",
-            ));
-        }
-
-        // Reject order-level fees.
-        if order
-            .get("fees")
-            .and_then(Value::as_array)
-            .is_some_and(|fees| !fees.is_empty())
-        {
-            return Err(backend("Relay returned unexpected application fees"));
-        }
-    }
-
-    // Reject top-level application fees.
-    if response.pointer("/fees/app").is_some_and(|app_fee| {
-        app_fee.get("amount").and_then(Value::as_str) != Some("0")
-            || app_fee.get("minimumAmount").and_then(Value::as_str) != Some("0")
-    }) {
-        return Err(backend("Relay returned an unexpected application fee"));
-    }
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

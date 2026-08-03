@@ -85,24 +85,6 @@ and Relay's enterprise `/execute` endpoint. Arbitrary sponsored contract calls
 require an enterprise API key, funded sponsorship policy, and a smart-account
 or other explicit execution model; those are a separate trust boundary.
 
-## Hyperliquid compatibility
-
-HyperCore deposits are a Hyperliquid product workflow, not the generic Relay
-contract. New Hyperliquid deposit routes and presets should live in the
-Hyperliquid petal and invoke this canonical transaction shape with HyperCore's
-pinned destination.
-
-The former routes remain available solely so existing durable operations and
-clients keep working:
-
-```text
-/petals/gasless/deposits/<wallet-alias>/<id>.json
-/petals/gasless/chains/<source>/deposits/<wallet-alias>/<id>.json
-```
-
-Those compatibility routes retain their original native-USDC-to-HyperCore
-validation and `gasless.deposit` signing intent.
-
 ## Development
 
 Live validation must stop after requesting Relay quotes. Do not complete an

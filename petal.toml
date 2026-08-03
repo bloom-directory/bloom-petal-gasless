@@ -22,7 +22,7 @@ methods = ["get", "post"]
 paths = ["/quote/v2", "/execute/permits", "/intents/status/v3"]
 
 [sign]
-allowed_intents = ["gasless.relay", "gasless.deposit"]
+allowed_intents = ["gasless.relay"]
 
 [store]
 namespaces = ["state"]

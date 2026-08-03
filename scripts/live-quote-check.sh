@@ -2,9 +2,8 @@
 # Live quote-only validation against Relay's public API.
 #
 # Verifies that Relay's response shape matches what the gasless petal's
-# validation logic expects, for both the generic transaction route and
-# the legacy Hyperliquid deposit route. Does NOT submit permits or move
-# funds — see AGENTS.md for authorization boundaries.
+# validation logic expects for the generic transaction route.
+# Does NOT submit permits or move funds.
 #
 # Usage:
 #   bash scripts/live-quote-check.sh
@@ -17,7 +16,6 @@ WALLET="0x03508bb71268bba25ecacc8f620e01866650532c"
 PERMIT_RECEIVER="0xccc88a9d1b4ed6b0eaba998850414b24f1c315be"
 BASE_USDC="0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
 OP_USDC="0x0b2c639c533813f4aa9d7837caf62653d097ff85"
-HL_USDC="0x00000000000000000000000000000000"
 
 pass=0
 fail=0
@@ -88,39 +86,6 @@ check "two refunds" \
   "$(echo "$generic" | jq -r '.protocol.v2.orderData.inputs[0].refunds | length')" "2"
 check "one output payment" \
   "$(echo "$generic" | jq -r '.protocol.v2.orderData.output.payments | length')" "1"
-
-echo ""
-echo "=== Legacy route: Base USDC → Hyperliquid ==="
-hl=$(curl -s -X POST "$RELAY/quote/v2" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"user\": \"$WALLET\",
-    \"originChainId\": 8453,
-    \"destinationChainId\": 1337,
-    \"originCurrency\": \"$BASE_USDC\",
-    \"destinationCurrency\": \"$HL_USDC\",
-    \"recipient\": \"$WALLET\",
-    \"tradeType\": \"EXACT_INPUT\",
-    \"amount\": \"100000000\",
-    \"refundTo\": \"$WALLET\",
-    \"usePermit\": true,
-    \"slippageTolerance\": \"50\"
-  }")
-
-check "exactly one step" \
-  "$(echo "$hl" | jq -r '.steps | length')" "1"
-check "step id is authorize1" \
-  "$(echo "$hl" | jq -r '.steps[0].id')" "authorize1"
-check "step kind is signature" \
-  "$(echo "$hl" | jq -r '.steps[0].kind')" "signature"
-check "permit receiver is pinned" \
-  "$(echo "$hl" | jq -r '.steps[0].items[0].data.sign.value.to')" "$PERMIT_RECEIVER"
-check "destination chain is 1337" \
-  "$(echo "$hl" | jq -r '.details.currencyOut.currency.chainId')" "1337"
-check "destination decimals are 8" \
-  "$(echo "$hl" | jq -r '.details.currencyOut.currency.decimals')" "8"
-check "two refund branches" \
-  "$(echo "$hl" | jq -r '.protocol.v2.orderData.inputs[0].refunds | length')" "2"
 
 echo ""
 echo "=== Results: $pass passed, $fail failed ==="

@@ -1,13 +1,8 @@
-//! Relay permit protocol, generic transaction state, and legacy deposit compatibility.
+//! Gasless Relay permit protocol and generic transaction state.
 
 mod common;
-mod legacy;
 mod relay;
 
-pub use legacy::{
-    GaslessDepositRequest, SOURCE_CHAINS, SourceChain, gasless_deposit, gasless_deposit_status,
-    source_chain,
-};
 pub use relay::{
     PermitDomain, RelayDestination, RelayOrigin, RelayTransactionRequest, gasless_transaction,
     gasless_transaction_status,
