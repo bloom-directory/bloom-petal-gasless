@@ -161,11 +161,14 @@ fn normalize_chain(value: &str, field: &str) -> Result<String, DispatchResponse>
 }
 
 fn validate_domain_part(value: &str, field: &str) -> Result<(), DispatchResponse> {
+    // EIP-712 domain names/versions are free-form strings, but we reject
+    // characters that could enable injection in downstream JSON processing.
+    // Allowed: alphanumeric, space, and common token-name punctuation.
     if value.is_empty()
         || value.len() > 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'-' | b'_' | b'.'))
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'-' | b'_' | b'.' | b'(' | b')')
+        })
     {
         return Err(invalid(format!("{field} is invalid")));
     }

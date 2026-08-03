@@ -878,6 +878,9 @@ fn gasless_deposit_status_with_host<H: Host>(
     wallet: &str,
     id: &str,
 ) -> DispatchResponse {
+    if !common::is_safe_segment(wallet) || !common::is_safe_segment(id) {
+        return common::invalid("wallet or id contains invalid characters");
+    }
     let chain = match source_chain(source) {
         Ok(chain) => chain,
         Err(error) => return error,
