@@ -1,21 +1,14 @@
-use alloy_dyn_abi::eip712::TypedData;
-use alloy_primitives::B256;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
-use petal::{
-    DispatchResponse, HostStatus, HttpRequest, HttpResponse, SdkError, SignHashOutcome, SignRequest,
+use petal::{DispatchResponse, SignHashOutcome, SignRequest};
+
+use crate::common::{
+    BloomHost, Host, MAX_BODY, MAX_DECIMALS, PERMIT_SUBMISSION_MARGIN_SECONDS,
+    RELAY_PERMIT_RECEIVER, ZERO_ADDRESS, backend, compact, denied, fetch, invalid, is_bytes32,
+    is_safe_segment, signature_hex, signing_hash, submit_permit, uint64_value,
 };
 
-const RELAY: &str = "https://api.relay.link";
-const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
-// Relay v3 ApprovalProxy. Every permit quote must independently prove that the
-// authorization is addressed to this receiver before Bloom asks the owner to
-// sign it.
-const RELAY_PERMIT_RECEIVER: &str = "0xccc88a9d1b4ed6b0eaba998850414b24f1c315be";
-const MAX_BODY: usize = 512 * 1024;
-const MAX_DECIMALS: u8 = 38;
-const PERMIT_SUBMISSION_MARGIN_SECONDS: u64 = 30;
 const SUBMISSION_UNKNOWN: &str =
     "Relay permit submission outcome is unknown; read this transaction to reconcile its status";
 
@@ -91,71 +84,6 @@ struct RelayTransactionState {
     submission: Option<String>,
 }
 
-trait Host {
-    fn store_get(&mut self, key: &str, max_bytes: usize) -> Result<Option<Vec<u8>>, String>;
-    fn store_put(&mut self, key: &str, value: &[u8]) -> Result<(), String>;
-    fn store_put_new(&mut self, key: &str, value: &[u8]) -> Result<bool, String>;
-    fn http_fetch(
-        &mut self,
-        request: &HttpRequest,
-        max_bytes: usize,
-    ) -> Result<HttpResponse, String>;
-    fn sign_hash(&mut self, request: &SignRequest) -> Result<SignHashOutcome, String>;
-    fn now_ms(&mut self) -> Result<u64, String>;
-}
-
-struct BloomHost;
-
-impl Host for BloomHost {
-    fn store_get(&mut self, key: &str, max_bytes: usize) -> Result<Option<Vec<u8>>, String> {
-        match petal::sdk::store_get(key, max_bytes) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(SdkError::Host(HostStatus::NotFound)) => Ok(None),
-            Err(error) => Err(error.message()),
-        }
-    }
-
-    fn store_put(&mut self, key: &str, value: &[u8]) -> Result<(), String> {
-        petal::sdk::store_put(key, value, false).map_err(|error| error.message())
-    }
-
-    fn store_put_new(&mut self, key: &str, value: &[u8]) -> Result<bool, String> {
-        match petal::sdk::store_put_new(key, value, false) {
-            Ok(()) => Ok(true),
-            Err(SdkError::Host(HostStatus::Denied)) => Ok(false),
-            Err(error) => Err(error.message()),
-        }
-    }
-
-    fn http_fetch(
-        &mut self,
-        request: &HttpRequest,
-        max_bytes: usize,
-    ) -> Result<HttpResponse, String> {
-        petal::sdk::http_fetch(request, max_bytes).map_err(|error| error.message())
-    }
-
-    fn sign_hash(&mut self, request: &SignRequest) -> Result<SignHashOutcome, String> {
-        petal::sdk::sign_hash(request).map_err(|error| error.message())
-    }
-
-    fn now_ms(&mut self) -> Result<u64, String> {
-        petal::sdk::try_now_ms().map_err(|error| error.message())
-    }
-}
-
-fn invalid(message: impl Into<String>) -> DispatchResponse {
-    petal::error(-3, message)
-}
-
-fn denied(message: impl Into<String>) -> DispatchResponse {
-    petal::error(-2, message)
-}
-
-fn backend(message: impl Into<String>) -> DispatchResponse {
-    petal::error(-4, message)
-}
-
 fn key(wallet: &str, id: &str) -> String {
     format!("state/relay-transactions/{wallet}/{id}.json")
 }
@@ -187,71 +115,6 @@ fn save_new<H: Host>(
     let bytes = serde_json::to_vec(state).map_err(|error| backend(error.to_string()))?;
     host.store_put_new(&key(&state.wallet, &state.id), &bytes)
         .map_err(backend)
-}
-
-fn fetch<H: Host>(
-    host: &mut H,
-    method: &str,
-    path: &str,
-    body: Vec<u8>,
-) -> Result<Value, DispatchResponse> {
-    let response = host
-        .http_fetch(
-            &HttpRequest {
-                method: method.into(),
-                url: format!("{RELAY}{path}"),
-                headers: vec![("content-type".into(), "application/json".into())],
-                body,
-            },
-            MAX_BODY,
-        )
-        .map_err(backend)?;
-    let value: Value = serde_json::from_slice(&response.body)
-        .map_err(|error| backend(format!("Relay returned invalid JSON: {error}")))?;
-    if !(200..300).contains(&response.status) {
-        return Err(backend(format!(
-            "Relay API status {}: {}",
-            response.status,
-            compact(&value)
-        )));
-    }
-    Ok(value)
-}
-
-fn submit_permit<H: Host>(host: &mut H, signature: &str, body: Vec<u8>) -> Result<(), ()> {
-    // Relay requires the signature in the URL. Never return the HTTP host's
-    // error because it may contain the complete replayable URL.
-    let response = host
-        .http_fetch(
-            &HttpRequest {
-                method: "POST".into(),
-                url: format!("{RELAY}/execute/permits?signature={signature}"),
-                headers: vec![("content-type".into(), "application/json".into())],
-                body,
-            },
-            MAX_BODY,
-        )
-        .map_err(|_| ())?;
-    if !(200..300).contains(&response.status) {
-        return Err(());
-    }
-    serde_json::from_slice::<Value>(&response.body)
-        .map(|_| ())
-        .map_err(|_| ())
-}
-
-fn compact(value: &Value) -> String {
-    serde_json::to_string(value)
-        .unwrap_or_else(|_| "<invalid>".into())
-        .chars()
-        .take(4096)
-        .collect()
-}
-
-fn is_bytes32(value: &str) -> bool {
-    value.len() == 66
-        && value.starts_with("0x")
-        && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn is_evm_address(value: &str) -> bool {
@@ -302,7 +165,7 @@ fn validate_domain_part(value: &str, field: &str) -> Result<(), DispatchResponse
         || value.len() > 64
         || !value
             .bytes()
-            .all(|byte| byte == b' ' || byte.is_ascii_graphic())
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'-' | b'_' | b'.'))
     {
         return Err(invalid(format!("{field} is invalid")));
     }
@@ -435,14 +298,6 @@ fn identifier_eq(actual: Option<&str>, expected: &str) -> bool {
         } else {
             actual == expected
         }
-    })
-}
-
-fn uint64_value(value: Option<&Value>) -> Option<u64> {
-    value.and_then(|value| {
-        value
-            .as_u64()
-            .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
     })
 }
 
@@ -839,52 +694,6 @@ fn validate_sign(input: QuoteInput<'_>, sign: &Value) -> Result<(u64, u64), Disp
     Ok((valid_after.unwrap(), valid_before.unwrap()))
 }
 
-fn signing_hash(sign: &Value) -> Result<B256, DispatchResponse> {
-    let primary_type = sign
-        .get("primaryType")
-        .and_then(Value::as_str)
-        .ok_or_else(|| backend("Relay typed data omitted its primary type"))?;
-    let mut types = Map::new();
-    types.insert(
-        "EIP712Domain".into(),
-        json!([
-            {"name":"name","type":"string"},
-            {"name":"version","type":"string"},
-            {"name":"chainId","type":"uint256"},
-            {"name":"verifyingContract","type":"address"}
-        ]),
-    );
-    types.insert(
-        primary_type.into(),
-        sign.pointer(&format!("/types/{primary_type}"))
-            .cloned()
-            .ok_or_else(|| backend("Relay typed data omitted its authorization type"))?,
-    );
-    let typed: TypedData = serde_json::from_value(json!({
-        "types": types,
-        "primaryType": primary_type,
-        "domain": sign.get("domain"),
-        "message": sign.get("value")
-    }))
-    .map_err(|error| backend(format!("invalid Relay typed data: {error}")))?;
-    typed
-        .eip712_signing_hash()
-        .map_err(|error| backend(format!("cannot hash Relay typed data: {error}")))
-}
-
-fn signature_hex(mut bytes: Vec<u8>) -> Result<String, DispatchResponse> {
-    if bytes.len() != 65 {
-        return Err(backend("wallet returned a non-EVM signature"));
-    }
-    if bytes[64] < 27 {
-        bytes[64] += 27;
-    }
-    if !matches!(bytes[64], 27 | 28) {
-        return Err(backend("wallet returned an invalid EVM recovery ID"));
-    }
-    Ok(format!("0x{}", hex::encode(bytes)))
-}
-
 fn ensure_permit_live<H: Host>(
     host: &mut H,
     state: &RelayTransactionState,
@@ -951,6 +760,9 @@ fn gasless_transaction_with_host<H: Host>(
     id: String,
     request: RelayTransactionRequest,
 ) -> DispatchResponse {
+    if !is_safe_segment(&wallet) || !is_safe_segment(&id) {
+        return invalid("wallet or id contains invalid characters");
+    }
     let (request, amount_units, minimum_output_units) = match bind_request(request, &address) {
         Ok(bound) => bound,
         Err(error) => return error,
@@ -1055,12 +867,14 @@ fn gasless_transaction_with_host<H: Host>(
         Err(error) => return denied(format!("signing denied: {error}")),
     };
 
-    let body = serde_json::to_vec(&json!({
+    let body = match serde_json::to_vec(&json!({
         "kind": "eip3009",
         "requestId": state.request_id,
         "api": state.permit_api
-    }))
-    .unwrap();
+    })) {
+        Ok(body) => body,
+        Err(error) => return backend(format!("cannot serialize permit body: {error}")),
+    };
     state.phase = "submitting".into();
     state.approval = None;
     if let Err(error) = save(host, &state) {
@@ -1086,10 +900,7 @@ fn gasless_transaction_with_host<H: Host>(
 }
 
 fn attempted_submission(phase: &str) -> bool {
-    matches!(
-        phase,
-        "submitting" | "submission_unknown" | "submission_failed" | "submitted"
-    )
+    matches!(phase, "submitting" | "submission_unknown" | "submitted")
 }
 
 fn relay_status_projection(state: &RelayTransactionState, value: &Value) -> Option<Value> {
@@ -1147,13 +958,7 @@ fn public_status(phase: &str, relay_status: Option<&Value>) -> String {
         .and_then(Value::as_str)
         .filter(|status| *status != "unavailable")
         .map(str::to_owned)
-        .unwrap_or_else(|| {
-            if phase == "submission_failed" {
-                "submission_unknown".into()
-            } else {
-                phase.into()
-            }
-        })
+        .unwrap_or_else(|| phase.into())
 }
 
 fn effective_local_phase(state: &RelayTransactionState, now_ms: u64) -> String {
@@ -1195,8 +1000,8 @@ fn next_action(state: &RelayTransactionState, status: &str) -> Value {
             "action": "create_new_transaction",
             "instruction": "The Relay permit expired. Use a new transaction ID; this transaction will not silently re-quote."
         }),
-        "submitting" | "submission_unknown" | "submission_failed" | "submitted" | "waiting"
-        | "depositing" | "pending" | "delayed" => json!({
+        "submitting" | "submission_unknown" | "submitted" | "waiting" | "depositing"
+        | "pending" | "delayed" => json!({
             "action": "poll",
             "instruction": "Read this transaction again; only Relay status success means completion."
         }),
@@ -1224,6 +1029,9 @@ fn gasless_transaction_status_with_host<H: Host>(
     wallet: &str,
     id: &str,
 ) -> DispatchResponse {
+    if !is_safe_segment(wallet) || !is_safe_segment(id) {
+        return invalid("wallet or id contains invalid characters");
+    }
     let state = match load(host, wallet, id) {
         Ok(Some(state)) => state,
         Ok(None) => {
@@ -1261,8 +1069,13 @@ fn gasless_transaction_status_with_host<H: Host>(
             &format!("/intents/status/v3?requestId={}", state.request_id),
             Vec::new(),
         ) {
-            Ok(value) => relay_status_projection(&state, &value)
-                .or_else(|| Some(json!({"status": "unavailable"}))),
+            Ok(value) => relay_status_projection(&state, &value).or_else(|| {
+                let raw = value.get("status").and_then(Value::as_str);
+                Some(match raw {
+                    Some(s) => json!({"status": "unavailable", "relay_status_raw": s}),
+                    None => json!({"status": "unavailable"}),
+                })
+            }),
             Err(DispatchResponse::Error { .. }) => Some(json!({"status": "unavailable"})),
             Err(_) => Some(json!({"status": "unavailable"})),
         }
@@ -1292,73 +1105,13 @@ fn gasless_transaction_status_with_host<H: Host>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, VecDeque};
+    use crate::common::signing_hash;
+    use crate::common::test_helpers::{MockHost, approval, signature};
 
     const WALLET: &str = "0x03508bb71268bba25ecacc8f620e01866650532c";
     const RECIPIENT: &str = "0x1111111111111111111111111111111111111111";
     const BASE_USDC: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
     const OPTIMISM_USDC: &str = "0x0b2c639c533813f4aa9d7837caf62653d097ff85";
-
-    #[derive(Default)]
-    struct MockHost {
-        store: HashMap<String, Vec<u8>>,
-        http_results: VecDeque<Result<HttpResponse, String>>,
-        sign_results: VecDeque<Result<SignHashOutcome, String>>,
-        requests: Vec<HttpRequest>,
-        sign_requests: Vec<SignRequest>,
-        now_ms: u64,
-    }
-
-    impl MockHost {
-        fn push_json(&mut self, status: u16, value: Value) {
-            self.http_results.push_back(Ok(HttpResponse {
-                status,
-                headers: Vec::new(),
-                body: serde_json::to_vec(&value).unwrap(),
-            }));
-        }
-    }
-
-    impl Host for MockHost {
-        fn store_get(&mut self, key: &str, _max_bytes: usize) -> Result<Option<Vec<u8>>, String> {
-            Ok(self.store.get(key).cloned())
-        }
-
-        fn store_put(&mut self, key: &str, value: &[u8]) -> Result<(), String> {
-            self.store.insert(key.into(), value.to_vec());
-            Ok(())
-        }
-
-        fn store_put_new(&mut self, key: &str, value: &[u8]) -> Result<bool, String> {
-            if self.store.contains_key(key) {
-                return Ok(false);
-            }
-            self.store.insert(key.into(), value.to_vec());
-            Ok(true)
-        }
-
-        fn http_fetch(
-            &mut self,
-            request: &HttpRequest,
-            _max_bytes: usize,
-        ) -> Result<HttpResponse, String> {
-            self.requests.push(request.clone());
-            self.http_results
-                .pop_front()
-                .expect("unexpected HTTP request")
-        }
-
-        fn sign_hash(&mut self, request: &SignRequest) -> Result<SignHashOutcome, String> {
-            self.sign_requests.push(request.clone());
-            self.sign_results
-                .pop_front()
-                .expect("unexpected signing request")
-        }
-
-        fn now_ms(&mut self) -> Result<u64, String> {
-            Ok(self.now_ms)
-        }
-    }
 
     fn request() -> RelayTransactionRequest {
         RelayTransactionRequest {
@@ -1474,20 +1227,6 @@ mod tests {
             },
             value,
         )
-    }
-
-    fn approval() -> SignHashOutcome {
-        SignHashOutcome::ApprovalRequired {
-            action_id: "approval-1".into(),
-            ceremony_url: "http://127.0.0.1/approve/approval-1".into(),
-            expires_ms: 1_500_000,
-        }
-    }
-
-    fn signature() -> SignHashOutcome {
-        let mut bytes = vec![0xab; 65];
-        bytes[64] = 0;
-        SignHashOutcome::Signature(bytes)
     }
 
     #[test]

@@ -1,24 +1,25 @@
 //! Compatibility implementation for pre-generic HyperCore deposit operations.
 
-use alloy_dyn_abi::eip712::TypedData;
-use alloy_primitives::B256;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use petal::{
-    DispatchResponse, HostStatus, HttpRequest, HttpResponse, SdkError, SignHashOutcome, SignRequest,
+use petal::{DispatchResponse, SignHashOutcome, SignRequest};
+
+use crate::common::{
+    self, BloomHost, Host, MAX_BODY, PERMIT_SUBMISSION_MARGIN_SECONDS, backend, compact, denied,
+    fetch, invalid, is_bytes32, signature_hex, signing_hash, submit_permit, uint64_value,
 };
 
-const RELAY: &str = "https://api.relay.link";
 const HYPERCORE_CHAIN_ID: u64 = 1337;
+// Hyperliquid is a non-EVM chain (chain ID 1337). Relay identifies its native
+// USDC with this 16-byte pseudo-address rather than a 20-byte EVM address.
+// This is intentional and matches Relay's internal representation.
 const HYPERLIQUID_USDC: &str = "0x00000000000000000000000000000000";
+const HYPERCORE_USDC_DECIMALS: usize = 8;
 // Relay v3 ApprovalProxy. Live quotes currently use the same receiver on every
 // supported source, but the receiver remains part of each registry entry so a
 // future chain-specific change must be reviewed explicitly.
-const RELAY_PERMIT_RECEIVER: &str = "0xccc88a9d1b4ed6b0eaba998850414b24f1c315be";
-const MAX_BODY: usize = 512 * 1024;
-const HYPERCORE_USDC_DECIMALS: usize = 8;
-const PERMIT_SUBMISSION_MARGIN_SECONDS: u64 = 30;
+const RELAY_PERMIT_RECEIVER: &str = common::RELAY_PERMIT_RECEIVER;
 const SUBMISSION_UNKNOWN: &str =
     "Relay permit submission outcome is unknown; read this deposit to reconcile its status";
 
@@ -81,60 +82,7 @@ pub fn source_chain(slug: &str) -> Result<SourceChain, DispatchResponse> {
         .iter()
         .copied()
         .find(|chain| chain.slug == slug)
-        .ok_or_else(|| invalid(format!("unsupported source chain: {slug}")))
-}
-
-trait Host {
-    fn store_get(&mut self, key: &str, max_bytes: usize) -> Result<Option<Vec<u8>>, String>;
-    fn store_put(&mut self, key: &str, value: &[u8]) -> Result<(), String>;
-    fn store_put_new(&mut self, key: &str, value: &[u8]) -> Result<bool, String>;
-    fn http_fetch(
-        &mut self,
-        request: &HttpRequest,
-        max_bytes: usize,
-    ) -> Result<HttpResponse, String>;
-    fn sign_hash(&mut self, request: &SignRequest) -> Result<SignHashOutcome, String>;
-    fn now_ms(&mut self) -> Result<u64, String>;
-}
-
-struct BloomHost;
-
-impl Host for BloomHost {
-    fn store_get(&mut self, key: &str, max_bytes: usize) -> Result<Option<Vec<u8>>, String> {
-        match petal::sdk::store_get(key, max_bytes) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(SdkError::Host(HostStatus::NotFound)) => Ok(None),
-            Err(error) => Err(error.message()),
-        }
-    }
-
-    fn store_put(&mut self, key: &str, value: &[u8]) -> Result<(), String> {
-        petal::sdk::store_put(key, value, false).map_err(|error| error.message())
-    }
-
-    fn store_put_new(&mut self, key: &str, value: &[u8]) -> Result<bool, String> {
-        match petal::sdk::store_put_new(key, value, false) {
-            Ok(()) => Ok(true),
-            Err(SdkError::Host(HostStatus::Denied)) => Ok(false),
-            Err(error) => Err(error.message()),
-        }
-    }
-
-    fn http_fetch(
-        &mut self,
-        request: &HttpRequest,
-        max_bytes: usize,
-    ) -> Result<HttpResponse, String> {
-        petal::sdk::http_fetch(request, max_bytes).map_err(|error| error.message())
-    }
-
-    fn sign_hash(&mut self, request: &SignRequest) -> Result<SignHashOutcome, String> {
-        petal::sdk::sign_hash(request).map_err(|error| error.message())
-    }
-
-    fn now_ms(&mut self) -> Result<u64, String> {
-        petal::sdk::try_now_ms().map_err(|error| error.message())
-    }
+        .ok_or_else(|| common::invalid(format!("unsupported source chain: {slug}")))
 }
 
 fn default_source_chain() -> String {
@@ -170,18 +118,6 @@ struct DepositState {
     approval: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     submission: Option<String>,
-}
-
-fn invalid(message: impl Into<String>) -> DispatchResponse {
-    petal::error(-3, message)
-}
-
-fn denied(message: impl Into<String>) -> DispatchResponse {
-    petal::error(-2, message)
-}
-
-fn backend(message: impl Into<String>) -> DispatchResponse {
-    petal::error(-4, message)
 }
 
 fn key(chain: SourceChain, wallet: &str, id: &str) -> String {
@@ -233,71 +169,6 @@ fn save_new<H: Host>(host: &mut H, state: &DepositState) -> Result<bool, Dispatc
     let bytes = serde_json::to_vec(state).map_err(|error| backend(error.to_string()))?;
     host.store_put_new(&key(chain, &state.wallet, &state.id), &bytes)
         .map_err(backend)
-}
-
-fn fetch<H: Host>(
-    host: &mut H,
-    method: &str,
-    path: &str,
-    body: Vec<u8>,
-) -> Result<Value, DispatchResponse> {
-    let response = host
-        .http_fetch(
-            &HttpRequest {
-                method: method.into(),
-                url: format!("{RELAY}{path}"),
-                headers: vec![("content-type".into(), "application/json".into())],
-                body,
-            },
-            MAX_BODY,
-        )
-        .map_err(backend)?;
-    let value: Value = serde_json::from_slice(&response.body)
-        .map_err(|error| backend(format!("Relay returned invalid JSON: {error}")))?;
-    if !(200..300).contains(&response.status) {
-        return Err(backend(format!(
-            "Relay API status {}: {}",
-            response.status,
-            compact(&value)
-        )));
-    }
-    Ok(value)
-}
-
-fn submit_permit<H: Host>(host: &mut H, signature: &str, body: Vec<u8>) -> Result<(), ()> {
-    // Relay requires the signature query parameter. Do not propagate any host
-    // error from this request: Bloom's HTTP host may include the complete URL.
-    let response = host
-        .http_fetch(
-            &HttpRequest {
-                method: "POST".into(),
-                url: format!("{RELAY}/execute/permits?signature={signature}"),
-                headers: vec![("content-type".into(), "application/json".into())],
-                body,
-            },
-            MAX_BODY,
-        )
-        .map_err(|_| ())?;
-    if !(200..300).contains(&response.status) {
-        return Err(());
-    }
-    serde_json::from_slice::<Value>(&response.body)
-        .map(|_| ())
-        .map_err(|_| ())
-}
-
-fn compact(value: &Value) -> String {
-    serde_json::to_string(value)
-        .unwrap_or_else(|_| "<invalid>".into())
-        .chars()
-        .take(4096)
-        .collect()
-}
-
-fn is_bytes32(value: &str) -> bool {
-    value.len() == 66
-        && value.starts_with("0x")
-        && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn decimal_units(amount: &str, decimals: usize, field: &str) -> Result<String, String> {
@@ -489,6 +360,7 @@ fn prepare_quote(
     {
         return Err(backend("Relay quote changed the requested input amount"));
     }
+    common::validate_order_safety(&response)?;
     validate_refunds(&response, chain, input.address)?;
     let amount_out_units = details
         .pointer("/currencyOut/amount")
@@ -590,14 +462,6 @@ fn validate_refunds(
     Ok(())
 }
 
-fn uint64_value(value: Option<&Value>) -> Option<u64> {
-    value.and_then(|value| {
-        value
-            .as_u64()
-            .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
-    })
-}
-
 fn validate_sign(
     chain: SourceChain,
     wallet: &str,
@@ -640,40 +504,6 @@ fn validate_sign(
         return Err(backend("Relay returned unsafe EIP-3009 signing data"));
     }
     Ok((valid_after.unwrap(), valid_before.unwrap()))
-}
-
-fn signing_hash(sign: &Value) -> Result<B256, DispatchResponse> {
-    let typed: TypedData = serde_json::from_value(json!({
-        "types": {
-            "EIP712Domain": [
-                {"name":"name","type":"string"},
-                {"name":"version","type":"string"},
-                {"name":"chainId","type":"uint256"},
-                {"name":"verifyingContract","type":"address"}
-            ],
-            "ReceiveWithAuthorization": sign.pointer("/types/ReceiveWithAuthorization")
-        },
-        "primaryType": "ReceiveWithAuthorization",
-        "domain": sign.get("domain"),
-        "message": sign.get("value")
-    }))
-    .map_err(|error| backend(format!("invalid Relay typed data: {error}")))?;
-    typed
-        .eip712_signing_hash()
-        .map_err(|error| backend(format!("cannot hash Relay typed data: {error}")))
-}
-
-fn signature_hex(mut bytes: Vec<u8>) -> Result<String, DispatchResponse> {
-    if bytes.len() != 65 {
-        return Err(backend("wallet returned a non-EVM signature"));
-    }
-    if bytes[64] < 27 {
-        bytes[64] += 27;
-    }
-    if !matches!(bytes[64], 27 | 28) {
-        return Err(backend("wallet returned an invalid EVM recovery id"));
-    }
-    Ok(format!("0x{}", hex::encode(bytes)))
 }
 
 fn ensure_permit_live<H: Host>(
@@ -745,6 +575,9 @@ pub fn gasless_deposit(
     id: String,
     request: GaslessDepositRequest,
 ) -> DispatchResponse {
+    if !common::is_safe_segment(&wallet) || !common::is_safe_segment(&id) {
+        return common::invalid("wallet or id contains invalid characters");
+    }
     gasless_deposit_with_host(&mut BloomHost, source, wallet, address, id, request)
 }
 
@@ -866,12 +699,14 @@ fn gasless_deposit_with_host<H: Host>(
         }
         Err(error) => return denied(format!("signing denied: {error}")),
     };
-    let body = serde_json::to_vec(&json!({
+    let body = match serde_json::to_vec(&json!({
         "kind": "eip3009",
         "requestId": state.request_id,
         "api": "swap"
-    }))
-    .unwrap();
+    })) {
+        Ok(body) => body,
+        Err(error) => return backend(format!("cannot serialize permit body: {error}")),
+    };
     state.phase = "submitting".into();
     state.approval = None;
     if let Err(error) = save(host, &state) {
@@ -1013,8 +848,8 @@ fn next_action(state: &DepositState, status: &str) -> Value {
             "action": "create_new_deposit",
             "instruction": "This legacy quote has no caller-defined minimum output. Use a new deposit id with minimum_output; it is unsafe to continue this deposit."
         }),
-        "submitting" | "submission_unknown" | "submission_failed" | "submitted" | "waiting"
-        | "depositing" | "pending" | "delayed" => json!({
+        "submitting" | "submission_unknown" | "submitted" | "waiting" | "depositing"
+        | "pending" | "delayed" => json!({
             "action": "poll",
             "instruction": "Read this deposit again; only Relay status success means completion."
         }),
@@ -1049,7 +884,20 @@ fn gasless_deposit_status_with_host<H: Host>(
     };
     let state = match load(host, chain, wallet, id) {
         Ok(Some(state)) => state,
-        Ok(None) => return petal::error(-1, "gasless deposit not found"),
+        Ok(None) => {
+            return petal::read_json_value(&json!({
+                "schema": "bloom.gasless.deposit.v1",
+                "status": "not_created",
+                "source_chain": chain.slug,
+                "source_chain_id": chain.chain_id,
+                "wallet": wallet,
+                "id": id,
+                "write": {
+                    "amount": "positive decimal amount of the source token",
+                    "minimum_output": "positive decimal floor on the destination token"
+                }
+            }));
+        }
         Err(error) => return error,
     };
     let relay_status = if attempted_submission(&state.phase) {
@@ -1059,8 +907,13 @@ fn gasless_deposit_status_with_host<H: Host>(
             &format!("/intents/status/v3?requestId={}", state.request_id),
             Vec::new(),
         ) {
-            Ok(value) => relay_status_projection(chain, &value)
-                .or_else(|| Some(json!({"status": "unavailable"}))),
+            Ok(value) => relay_status_projection(chain, &value).or_else(|| {
+                let raw = value.get("status").and_then(Value::as_str);
+                Some(match raw {
+                    Some(s) => json!({"status": "unavailable", "relay_status_raw": s}),
+                    None => json!({"status": "unavailable"}),
+                })
+            }),
             Err(DispatchResponse::Error { .. }) => Some(json!({"status": "unavailable"})),
             Err(_) => Some(json!({"status": "unavailable"})),
         }
@@ -1092,90 +945,16 @@ fn gasless_deposit_status_with_host<H: Host>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, VecDeque};
+    use crate::common::signing_hash;
+    use crate::common::test_helpers::{MockHost, approval, signature};
 
     const WALLET: &str = "0x03508bb71268bba25ecacc8f620e01866650532c";
-
-    #[derive(Default)]
-    struct MockHost {
-        store: HashMap<String, Vec<u8>>,
-        http_results: VecDeque<Result<HttpResponse, String>>,
-        sign_results: VecDeque<Result<SignHashOutcome, String>>,
-        requests: Vec<HttpRequest>,
-        sign_requests: Vec<SignRequest>,
-        now_ms: u64,
-    }
-
-    impl MockHost {
-        fn push_json(&mut self, status: u16, value: Value) {
-            self.http_results.push_back(Ok(HttpResponse {
-                status,
-                headers: Vec::new(),
-                body: serde_json::to_vec(&value).unwrap(),
-            }));
-        }
-    }
-
-    impl Host for MockHost {
-        fn store_get(&mut self, key: &str, _max_bytes: usize) -> Result<Option<Vec<u8>>, String> {
-            Ok(self.store.get(key).cloned())
-        }
-
-        fn store_put(&mut self, key: &str, value: &[u8]) -> Result<(), String> {
-            self.store.insert(key.into(), value.to_vec());
-            Ok(())
-        }
-
-        fn store_put_new(&mut self, key: &str, value: &[u8]) -> Result<bool, String> {
-            if self.store.contains_key(key) {
-                return Ok(false);
-            }
-            self.store.insert(key.into(), value.to_vec());
-            Ok(true)
-        }
-
-        fn http_fetch(
-            &mut self,
-            request: &HttpRequest,
-            _max_bytes: usize,
-        ) -> Result<HttpResponse, String> {
-            self.requests.push(request.clone());
-            self.http_results
-                .pop_front()
-                .expect("unexpected HTTP request")
-        }
-
-        fn sign_hash(&mut self, request: &SignRequest) -> Result<SignHashOutcome, String> {
-            self.sign_requests.push(request.clone());
-            self.sign_results
-                .pop_front()
-                .expect("unexpected signing request")
-        }
-
-        fn now_ms(&mut self) -> Result<u64, String> {
-            Ok(self.now_ms)
-        }
-    }
 
     fn request() -> GaslessDepositRequest {
         GaslessDepositRequest {
             amount: "100".into(),
             minimum_output: "99".into(),
         }
-    }
-
-    fn approval() -> SignHashOutcome {
-        SignHashOutcome::ApprovalRequired {
-            action_id: "approval-1".into(),
-            ceremony_url: "http://127.0.0.1/approve/approval-1".into(),
-            expires_ms: 1_500_000,
-        }
-    }
-
-    fn signature() -> SignHashOutcome {
-        let mut bytes = vec![0xab; 65];
-        bytes[64] = 0;
-        SignHashOutcome::Signature(bytes)
     }
 
     fn ethereum() -> SourceChain {

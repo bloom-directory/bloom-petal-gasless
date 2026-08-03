@@ -1,5 +1,6 @@
 //! Relay permit protocol, generic transaction state, and legacy deposit compatibility.
 
+mod common;
 mod legacy;
 mod relay;
 
