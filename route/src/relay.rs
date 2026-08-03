@@ -381,6 +381,11 @@ fn prepare_quote(
     }
 
     let (_, permit_valid_before) = validate_sign(input, &sign)?;
+    // Relay's `api` field selects its internal permit routing. Live quotes
+    // for USDC transfers return "swap" for both same-chain and cross-chain.
+    // "bridge" and "user-swap" are accepted for routing variants Relay may
+    // use for other token pairs or execution paths; an unexpected value is
+    // rejected by the filter below.
     let permit_api = item
         .pointer("/data/post/body/api")
         .and_then(Value::as_str)
