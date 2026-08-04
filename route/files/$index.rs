@@ -3,5 +3,7 @@ petal::route_file!(
     list: vec![
         petal::dir("transactions"),
         petal::file("status.json"),
+        petal::file("README.md"),
+        petal::file("AGENTS.md"),
     ]
 );
