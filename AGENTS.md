@@ -59,15 +59,10 @@ submission; only a later Relay `success` status means settlement.
 Never expose or persist a wallet signature. Treat permit-submission transport
 errors as opaque because Relay requires the signature in the request URL.
 
-The historical HyperCore deposit routes remain compatibility surfaces:
-
-- `/petals/gasless/deposits/<wallet>/<id>.json` (Ethereum only)
-- `/petals/gasless/chains/<source>/deposits/<wallet>/<id>.json`
-
-They retain their original source-USDC and HyperCore-USDC policy so existing
-operations can be read, retried, and reconciled without changing signing
-intent or durable keys. New Hyperliquid-specific presets and deposit UX belong
-in the Hyperliquid petal and should compose the canonical generic route.
+Hyperliquid deposits flow through the canonical generic route:
+destination.chain_id 1337 and non-EVM destination currency identifiers are
+accepted as safe Relay strings. Hyperliquid-specific presets and deposit UX
+belong in the Hyperliquid petal and should compose the canonical generic route.
 
 Do not execute live fund-moving tests without separate explicit authorization.
 Live quote-only validation is allowed.
