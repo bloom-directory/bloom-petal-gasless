@@ -2,12 +2,10 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PETAL_REV="b9fc22d6d8211bc41304b38b1ef8b5269c8035bd"
+PETAL_REV="eda6647c523bba161eaa22812aa0e75ec7782404"
 
 if [[ -n "${PETAL_BIN:-}" ]]; then
   "$PETAL_BIN" build --root "$ROOT"
-elif command -v petal >/dev/null 2>&1; then
-  petal build --root "$ROOT"
 else
   tool_root="$ROOT/target/petal-tool"
   cargo install \
