@@ -760,10 +760,14 @@ pub fn gasless_transaction(
     id: String,
     request: RelayTransactionRequest,
 ) -> DispatchResponse {
+    let route = match route_id(ctx) {
+        Ok(route) => route,
+        Err(error) => return error,
+    };
     gasless_transaction_with_context(
         &mut BloomHost,
         &ctx.package_hash,
-        route_id(ctx),
+        route,
         wallet,
         address,
         id,
@@ -990,11 +994,11 @@ fn gasless_transaction_with_context<H: Host>(
     DispatchResponse::Write
 }
 
-fn route_id(ctx: &petal::Ctx) -> &str {
+fn route_id(ctx: &petal::Ctx) -> Result<&str, DispatchResponse> {
     ctx.params
         .iter()
         .find_map(|(name, value)| (name == "bloom.route_id").then_some(value.as_str()))
-        .unwrap_or("transactions/[wallet]/[id].json")
+        .ok_or_else(|| backend("trusted Petal route id is unavailable"))
 }
 
 fn attempted_submission(phase: &str) -> bool {
