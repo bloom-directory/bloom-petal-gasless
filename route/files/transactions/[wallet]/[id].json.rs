@@ -60,6 +60,6 @@ petal::route_file!(
             Ok(request) => request,
             Err(error) => return petal::error(-3, format!("invalid request JSON: {error}")),
         };
-        crate::gasless_transaction(wallet, address, id, request)
+        crate::gasless_transaction(ctx, wallet, address, id, request)
     },
 );

@@ -57,7 +57,7 @@ dependencies = [
  "rustc-hash",
  "secp256k1",
  "serde",
- "sha3",
+ "sha3 0.11.0",
 ]
 
 [[package]]
@@ -97,7 +97,7 @@ dependencies = [
  "proc-macro-error3",
  "proc-macro2",
  "quote",
- "sha3",
+ "sha3 0.11.0",
  "syn 2.0.119",
  "syn-solidity",
 ]
@@ -534,11 +534,13 @@ dependencies = [
 [[package]]
 name = "bloom-petal-sdk"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/petal?rev=b9fc22d6d8211bc41304b38b1ef8b5269c8035bd#b9fc22d6d8211bc41304b38b1ef8b5269c8035bd"
+source = "git+https://github.com/bloom-directory/petal?rev=61938d0c127cfe03c7e3e55baed0ba1439bc5ca2#61938d0c127cfe03c7e3e55baed0ba1439bc5ca2"
 dependencies = [
  "getrandom 0.2.17",
  "serde",
+ "serde_jcs",
  "serde_json",
+ "sha2",
  "wit-bindgen",
 ]
 
@@ -993,7 +995,10 @@ dependencies = [
  "bloom-petal-sdk",
  "hex",
  "serde",
+ "serde_jcs",
  "serde_json",
+ "sha2",
+ "sha3 0.10.9",
 ]
 
 [[package]]
@@ -1225,6 +1230,15 @@ dependencies = [
  "elliptic-curve",
  "once_cell",
  "sha2",
+]
+
+[[package]]
+name = "keccak"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb26cec98cce3a3d96cbb7bced3c4b16e3d13f27ec56dbd62cbc8f39cfb9d653"
+dependencies = [
+ "cpufeatures 0.2.17",
 ]
 
 [[package]]
@@ -1713,6 +1727,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "ryu-js"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6518fc26bced4d53678a22d6e423e9d8716377def84545fe328236e3af070e7f"
+
+[[package]]
 name = "schemars"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1825,6 +1845,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_jcs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cacecf649bc1a7c5f0e299cc813977c6a78116abda2b93b1ee01735b71ead9a8"
+dependencies = [
+ "ryu-js",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "serde_json"
 version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1869,12 +1900,22 @@ dependencies = [
 
 [[package]]
 name = "sha3"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77fd7028345d415a4034cf8777cd4f8ab1851274233b45f84e3d955502d93874"
+dependencies = [
+ "digest 0.10.7",
+ "keccak 0.1.6",
+]
+
+[[package]]
+name = "sha3"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be176f1a57ce4e3d31c1a166222d9768de5954f811601fb7ca06fc8203905ce1"
 dependencies = [
  "digest 0.11.3",
- "keccak",
+ "keccak 0.2.0",
 ]
 
 [[package]]
