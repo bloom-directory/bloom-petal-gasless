@@ -167,11 +167,20 @@ bloom vfs cat /petals/gasless/transactions/<wallet>/<id>.json
   in the Petal's own state. Complete the ceremony, then retry the **exact same
   write**. The petal retains the same Relay request ID and signing hash across
   retries.
-- **What the owner sees**: the approval page shows the permit's debit as the
-  Petal declares it: the exact origin amount in base units, the origin token
-  contract, and the origin chain. Bloom labels these figures as claimed, not
-  verified; the destination and minimum output are in the Petal's
-  transaction file, so review them there before approving.
+- **The recipient must be allowed by wallet policy**: the signing claim
+  declares the destination chain and resolved recipient, and Bloom refuses to
+  sign a destination outside the wallet's `allowed_destinations`. A gasless
+  transfer never stages an outbox entry, so this claim is the only place that
+  check can happen. Add the recipient before the first transfer, including
+  when it is the wallet's own address on the destination chain. Bloom compares
+  destinations exactly, and this Petal declares lowercase addresses, so the
+  policy entry must be lowercase too.
+- **What the owner sees**: the approval page shows the permit's debit and its
+  destination as the Petal declares them: the exact origin amount in base
+  units, the origin token contract and chain, and the recipient with its
+  chain. Bloom labels these figures as claimed, not verified; the minimum
+  output is in the Petal's transaction file, so review it there before
+  approving.
 - **Permit expiry**: if the Relay permit expires before signing, the
   transaction is permanently `quote_expired`. Create a new one with a new ID.
 - **Signatures**: never stored or returned. Transport errors during permit

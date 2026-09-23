@@ -152,8 +152,12 @@ fn normalize_relay_identifier(value: &str, field: &str) -> Result<String, Dispat
 }
 
 fn normalize_chain(value: &str, field: &str) -> Result<String, DispatchResponse> {
+    // The chain slug is declared to the Broker as a protocol token, which must
+    // begin with a lowercase letter. Reject a leading digit here so the caller
+    // sees the reason, rather than an opaque signing refusal after the quote.
     if value.is_empty()
         || value.len() > 64
+        || !value.starts_with(|c: char| c.is_ascii_lowercase())
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
@@ -896,13 +900,25 @@ fn gasless_transaction_with_context<H: Host>(
         ]
         .concat(),
     );
-    // The Broker renders the owner's approval page from the declared
-    // amounts, not from `action`, so the permit's real debit is declared here:
-    // the bound origin token and the exact base units the permit authorizes
-    // (the same `value` the permit carries). Destinations stay undeclared for
-    // now: a declared destination makes the Broker enforce the wallet's
-    // `allowed_destinations`, which would require every recipient, including
-    // the wallet's own address on another chain, to be allow-listed first.
+    // `bind_request` always resolves this, defaulting to the wallet's own
+    // address, so a missing recipient here means the stored state is corrupt.
+    let Some(recipient) = state.request.destination.recipient.as_deref() else {
+        return backend("stored Relay transaction has no resolved recipient");
+    };
+    // The claim is the only place this operation's value and recipient can be
+    // checked. A gasless transfer never stages an outbox entry, so the
+    // transaction engine never sees it and cannot evaluate destination policy
+    // from a decoded plan the way an ordinary EVM send does.
+    //
+    // The debit is the bound origin token and the exact base units the permit
+    // authorizes, which is the same `value` the permit carries. The
+    // destination is the bound chain and resolved recipient. Both are
+    // required: the Broker enforces the wallet's `allowed_destinations`
+    // against the declared destination, and the owner's approval page renders
+    // the amount and recipient from these fields rather than from `action`.
+    // Declaring the recipient is what makes the caller-selected
+    // `destination.recipient` subject to policy instead of bypassing it.
+    //
     // The fee is `none` because the `gasless.relay` class has no fee asset.
     let claim = json!({
         "package_hash": package_hash,
@@ -918,7 +934,10 @@ fn gasless_transaction_with_context<H: Host>(
             },
             "amount": state.amount_units
         }],
-        "declared_destinations": [],
+        "declared_destinations": [{
+            "chain": state.request.destination.chain,
+            "destination": recipient
+        }],
         "declared_fee": {"kind": "none"},
         "nonce": hex::encode(&nonce[..CLAIM_NONCE_BYTES]),
         "claim_assurance": {"kind": "machine_asserted"}
@@ -1425,6 +1444,14 @@ mod tests {
     }
 
     #[test]
+    fn chain_slugs_must_start_with_a_lowercase_letter() {
+        // The slug is declared to the Broker as a protocol token.
+        assert!(normalize_chain("base", "destination.chain").is_ok());
+        assert!(normalize_chain("arbitrum-nova", "destination.chain").is_ok());
+        assert!(normalize_chain("1inch", "destination.chain").is_err());
+    }
+
+    #[test]
     fn full_lifecycle_reuses_the_quote_and_reconciles_success() {
         let mut host = MockHost {
             now_ms: 1_000_000,
@@ -1480,7 +1507,13 @@ mod tests {
             claim["declared_debits"][0]["amount"],
             json!(bound_request().1)
         );
-        assert_eq!(claim["declared_destinations"], json!([]));
+        // The recipient must be declared: a gasless transfer never stages an
+        // outbox entry, so this claim is the only place the Broker can enforce
+        // the wallet's allowed_destinations against a caller-chosen recipient.
+        assert_eq!(
+            claim["declared_destinations"],
+            json!([{"chain": "optimism", "destination": WALLET}])
+        );
         assert_eq!(claim["declared_fee"], json!({"kind": "none"}));
         let nonce = claim["nonce"].as_str().expect("nonce is hex");
         assert_eq!(nonce.len(), CLAIM_NONCE_BYTES * 2, "{nonce}");
