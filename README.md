@@ -12,7 +12,8 @@ origin chain's native gas token is never required.
 | `/petals/gasless/transactions/<wallet>/<id>.json` | Read | Query transaction state |
 | `/petals/gasless/transactions/<wallet>/<id>.json` | Write | Create or advance a transaction |
 
-`<wallet>` is a Bloom wallet alias. `<id>` is a caller-chosen idempotency key
+`<wallet>` is a Bloom wallet alias, never an address; its EVM address is read
+from `wallets/<wallet>/0/address.evm` (account 0). `<id>` is a caller-chosen idempotency key
 (alphanumeric, `-`, `_`, `.`, max 128 chars).
 
 ## Supported Origin Tokens

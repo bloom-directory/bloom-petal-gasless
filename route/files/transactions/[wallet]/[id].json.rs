@@ -6,7 +6,7 @@ petal::route_file!(
         "bloom:vfs.read",
     ]),
     read: |ctx: &petal::Ctx| {
-        let wallet = match petal::param(ctx, "wallet").and_then(|value| {
+        let wallet = match petal::wallet_param(ctx).and_then(|value| {
             if petal::is_safe_segment(value) && value.len() <= 128 {
                 Ok(value)
             } else {
@@ -32,7 +32,7 @@ petal::route_file!(
         if body.len() > 16 * 1024 {
             return petal::error(-3, "request body is too large");
         }
-        let wallet = match petal::param(ctx, "wallet").and_then(|value| {
+        let wallet = match petal::wallet_param(ctx).and_then(|value| {
             if petal::is_safe_segment(value) && value.len() <= 128 {
                 Ok(value.to_owned())
             } else {

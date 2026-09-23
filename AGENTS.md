@@ -7,8 +7,11 @@
 | `/petals/gasless/status.json` | Health + capability info (no side effects) | — |
 | `/petals/gasless/transactions/<wallet>/<id>.json` | Transaction state + `next` action | Create or advance transaction |
 
-`<wallet>` is a Bloom wallet alias — resolve its EVM address through the VFS for
-Relay, but retain the alias for Bloom signing. `<id>` is a caller-defined,
+`<wallet>` is a Bloom wallet alias, never an address. The Petal is wallet-scoped
+and acts for account 0: it reads the EVM address from
+`wallets/<wallet>/0/address.evm` for Relay and retains the alias for Bloom
+signing. A wallet without that leaf is refused with an error naming the path.
+`<id>` is a caller-defined,
 durable idempotency key (alphanumeric, `-`, `_`, `.`, max 128 chars).
 
 ## Supported Origin Tokens
