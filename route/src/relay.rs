@@ -10,6 +10,10 @@ use crate::common::{
     is_safe_segment, signature_hex, signing_payload, submit_permit, uint64_value,
 };
 
+/// Width of the Broker's request nonce (`RequestNonce`); the claim nonce
+/// must be exactly this many bytes.
+const CLAIM_NONCE_BYTES: usize = 16;
+
 const SUBMISSION_UNKNOWN: &str =
     "Relay permit submission outcome is unknown; read this transaction to reconcile its status";
 
@@ -892,6 +896,14 @@ fn gasless_transaction_with_context<H: Host>(
         ]
         .concat(),
     );
+    // The Broker renders the owner's approval page from the declared
+    // amounts, not from `action`, so the permit's real debit is declared here:
+    // the bound origin token and the exact base units the permit authorizes
+    // (the same `value` the permit carries). Destinations stay undeclared for
+    // now: a declared destination makes the Broker enforce the wallet's
+    // `allowed_destinations`, which would require every recipient, including
+    // the wallet's own address on another chain, to be allow-listed first.
+    // The fee is `none` because the `gasless.relay` class has no fee asset.
     let claim = json!({
         "package_hash": package_hash,
         "route": route,
@@ -899,10 +911,16 @@ fn gasless_transaction_with_context<H: Host>(
         "crypto_suite": "secp256k1-keccak256-recoverable",
         "payload_digest": hex::encode(payload_digest),
         "ordered_hashes": [hex::encode(payload.hash)],
-        "declared_debits": [],
+        "declared_debits": [{
+            "asset": {
+                "chain": state.request.origin.chain,
+                "asset": state.request.origin.currency
+            },
+            "amount": state.amount_units
+        }],
         "declared_destinations": [],
         "declared_fee": {"kind": "none"},
-        "nonce": hex::encode(&nonce[..16]),
+        "nonce": hex::encode(&nonce[..CLAIM_NONCE_BYTES]),
         "claim_assurance": {"kind": "machine_asserted"}
     });
     let approval_hint = state.approval.as_ref().and_then(|approval| {
@@ -1445,6 +1463,31 @@ mod tests {
         assert_eq!(
             host.sign_requests[1].approval_hint.as_deref(),
             Some("approval-1")
+        );
+        // The owner's approval page is rendered from the claim, so it must
+        // declare the permit's real debit: the bound origin token and the
+        // exact base units the permit carries.
+        let claim: Value = serde_json::from_slice(&host.sign_requests[0].petal_use_claim_jcs)
+            .expect("claim is JSON");
+        assert_eq!(
+            claim["declared_debits"],
+            json!([{
+                "asset": {"chain": "base", "asset": BASE_USDC},
+                "amount": "100000000"
+            }])
+        );
+        assert_eq!(
+            claim["declared_debits"][0]["amount"],
+            json!(bound_request().1)
+        );
+        assert_eq!(claim["declared_destinations"], json!([]));
+        assert_eq!(claim["declared_fee"], json!({"kind": "none"}));
+        let nonce = claim["nonce"].as_str().expect("nonce is hex");
+        assert_eq!(nonce.len(), CLAIM_NONCE_BYTES * 2, "{nonce}");
+        assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            host.sign_requests[0].petal_use_claim_jcs,
+            host.sign_requests[1].petal_use_claim_jcs
         );
         assert_eq!(
             host.requests

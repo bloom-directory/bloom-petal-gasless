@@ -143,7 +143,7 @@ bloom vfs cat /petals/gasless/transactions/<wallet>/<id>.json
 |---|---|---|
 | `not_created` | No transaction at this ID. Response includes a write template. | Write to create. |
 | `awaiting_signature` | Quote accepted; next write will attempt signing. | Retry write to sign. |
-| `approval_required` | Bloom needs the wallet owner's approval. | Open `approval.ceremony_url`, approve, then retry the exact write body from `next.retry_write_body`. |
+| `approval_required` | Bloom needs the wallet owner's approval. | Read `/bloom/petal-signing-requests/<approval.action_id>.json` for the `ceremony_url`, have the owner approve it, then retry the exact write body from `next.retry_write_body`. |
 | `approval_expired` | The approval ceremony timed out. | Retry the write to get a fresh ceremony (same Relay request). |
 | `quote_expired` | The Relay permit's `validBefore` has passed. | Use a **new** transaction ID; the petal never silently re-quotes. |
 | `submitting` | Signing succeeded; permit is being submitted to Relay. | Poll by reading again. |
@@ -161,8 +161,17 @@ bloom vfs cat /petals/gasless/transactions/<wallet>/<id>.json
   wallet, route, amount, and minimum output. A retry with different parameters
   is rejected.
 - **Approval**: when `approval_required`, the write is denied but state is
-  persisted. Complete the ceremony URL, then retry the **exact same write**.
-  The petal retains the same Relay request ID and signing hash across retries.
+  persisted. `approval.action_id` is Bloom's public id for the pending
+  signing request; the owner-facing ceremony link lives in Bloom's projection
+  at `/bloom/petal-signing-requests/<action_id>.json` (`ceremony_url`), never
+  in the Petal's own state. Complete the ceremony, then retry the **exact same
+  write**. The petal retains the same Relay request ID and signing hash across
+  retries.
+- **What the owner sees**: the approval page shows the permit's debit as the
+  Petal declares it: the exact origin amount in base units, the origin token
+  contract, and the origin chain. Bloom labels these figures as claimed, not
+  verified; the destination and minimum output are in the Petal's
+  transaction file, so review them there before approving.
 - **Permit expiry**: if the Relay permit expires before signing, the
   transaction is permanently `quote_expired`. Create a new one with a new ID.
 - **Signatures**: never stored or returned. Transport errors during permit
