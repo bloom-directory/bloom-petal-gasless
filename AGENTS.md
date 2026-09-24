@@ -7,8 +7,11 @@
 | `/petals/gasless/status.json` | Health + capability info (no side effects) | — |
 | `/petals/gasless/transactions/<wallet>/<id>.json` | Transaction state + `next` action | Create or advance transaction |
 
-`<wallet>` is a Bloom wallet alias — resolve its EVM address through the VFS for
-Relay, but retain the alias for Bloom signing. `<id>` is a caller-defined,
+`<wallet>` is a Bloom wallet alias, never an address. The Petal is wallet-scoped
+and acts for account 0: it reads the EVM address from
+`wallets/<wallet>/0/address.evm` for Relay and retains the alias for Bloom
+signing. A wallet without that leaf is refused with an error naming the path.
+`<id>` is a caller-defined,
 durable idempotency key (alphanumeric, `-`, `_`, `.`, max 128 chars).
 
 ## Supported Origin Tokens
@@ -126,7 +129,9 @@ Every read returns a JSON object with:
   applicable)
 - `request` — the original bound request
 - `quote` — Relay's quote details (amounts, fees, timing, permit expiry)
-- `approval` — ceremony URL and expiry (only when `approval_required`)
+- `approval` — `action_id`, `expires_ms`, and `retry_write_body` (only when
+  `approval_required`). The ceremony link is Bloom's, not the Petal's: read
+  `/petal-signing-requests/<action_id>.json` for `ceremony_url`.
 - `submission` — `"accepted"` or `"unknown"` (after signing)
 - `relay` — projected Relay status with tx hashes (after submission)
 
@@ -134,7 +139,7 @@ Every read returns a JSON object with:
 
 | `next.action` | When | What to do |
 |---|---|---|
-| `review_route_then_approve` | `approval_required` | Review origin/destination/amount/output. Open `approval.ceremony_url`. After approval, retry the exact `next.retry_write_body`. |
+| `review_route_then_approve` | `approval_required` | Review origin/destination/amount/output. Read `/petal-signing-requests/<approval.action_id>.json` and open its `ceremony_url`. After approval, retry the exact `next.retry_write_body`. |
 | `retry_write` | `approval_expired` or unknown status | Retry the write with `next.retry_write_body` to get a fresh ceremony or re-attempt signing. |
 | `create_new_transaction` | `quote_expired` | This ID is dead. Create a new transaction with a new ID. |
 | `poll` | `submitting` through `delayed` | Read again later. Only Relay `success` means done. |

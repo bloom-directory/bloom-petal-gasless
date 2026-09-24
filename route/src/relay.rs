@@ -1,13 +1,18 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use petal::{DispatchResponse, SignHashOutcome, SignRequest};
+use petal::{DispatchResponse, PayloadSignItem, PayloadSignRequest, SignOutcome, SignSelector};
+use sha2::{Digest as _, Sha256};
 
 use crate::common::{
     BloomHost, Host, MAX_BODY, MAX_DECIMALS, PERMIT_SUBMISSION_MARGIN_SECONDS,
     RELAY_PERMIT_RECEIVER, ZERO_ADDRESS, backend, compact, denied, fetch, invalid, is_bytes32,
-    is_safe_segment, signature_hex, signing_hash, submit_permit, uint64_value,
+    is_safe_segment, signature_hex, signing_payload, submit_permit, uint64_value,
 };
+
+/// Width of the Broker's request nonce (`RequestNonce`); the claim nonce
+/// must be exactly this many bytes.
+const CLAIM_NONCE_BYTES: usize = 16;
 
 const SUBMISSION_UNKNOWN: &str =
     "Relay permit submission outcome is unknown; read this transaction to reconcile its status";
@@ -147,8 +152,12 @@ fn normalize_relay_identifier(value: &str, field: &str) -> Result<String, Dispat
 }
 
 fn normalize_chain(value: &str, field: &str) -> Result<String, DispatchResponse> {
+    // The chain slug is declared to the Broker as a protocol token, which must
+    // begin with a lowercase letter. Reject a leading digit here so the caller
+    // sees the reason, rather than an opaque signing refusal after the quote.
     if value.is_empty()
         || value.len() > 64
+        || !value.starts_with(|c: char| c.is_ascii_lowercase())
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
@@ -753,16 +762,50 @@ fn validate_request_constraints(
 }
 
 pub fn gasless_transaction(
+    ctx: &petal::Ctx,
     wallet: String,
     address: String,
     id: String,
     request: RelayTransactionRequest,
 ) -> DispatchResponse {
-    gasless_transaction_with_host(&mut BloomHost, wallet, address, id, request)
+    let route = match route_id(ctx) {
+        Ok(route) => route,
+        Err(error) => return error,
+    };
+    gasless_transaction_with_context(
+        &mut BloomHost,
+        &ctx.package_hash,
+        route,
+        wallet,
+        address,
+        id,
+        request,
+    )
 }
 
+#[cfg(test)]
 fn gasless_transaction_with_host<H: Host>(
     host: &mut H,
+    wallet: String,
+    address: String,
+    id: String,
+    request: RelayTransactionRequest,
+) -> DispatchResponse {
+    gasless_transaction_with_context(
+        host,
+        "test-package-hash",
+        "transactions/[wallet]/[id].json",
+        wallet,
+        address,
+        id,
+        request,
+    )
+}
+
+fn gasless_transaction_with_context<H: Host>(
+    host: &mut H,
+    package_hash: &str,
+    route: &str,
     wallet: String,
     address: String,
     id: String,
@@ -836,31 +879,112 @@ fn gasless_transaction_with_host<H: Host>(
     if let Err(error) = ensure_permit_live(host, &state) {
         return error;
     }
-    let hash = match signing_hash(&state.sign) {
-        Ok(hash) => hash,
+    let payload = match signing_payload(&state.sign) {
+        Ok(payload) => payload,
         Err(error) => return error,
     };
-    let mut hash32 = [0_u8; 32];
-    hash32.copy_from_slice(hash.as_slice());
-    let signature = match host.sign_hash(&SignRequest {
+    let item = PayloadSignItem {
+        preimage: payload.preimage.clone(),
+        claimed_hash: payload.hash.into(),
+    };
+    let payload_digest = match petal::payload_batch_digest(&[item]) {
+        Ok(digest) => digest,
+        Err(error) => return backend(error.message()),
+    };
+    let nonce = Sha256::digest(
+        [
+            package_hash.as_bytes(),
+            route.as_bytes(),
+            b"gasless.relay",
+            payload_digest.as_slice(),
+        ]
+        .concat(),
+    );
+    // `bind_request` always resolves this, defaulting to the wallet's own
+    // address, so a missing recipient here means the stored state is corrupt.
+    let Some(recipient) = state.request.destination.recipient.as_deref() else {
+        return backend("stored Relay transaction has no resolved recipient");
+    };
+    // The claim is the only place this operation's value and recipient can be
+    // checked. A gasless transfer never stages an outbox entry, so the
+    // transaction engine never sees it and cannot evaluate destination policy
+    // from a decoded plan the way an ordinary EVM send does.
+    //
+    // The debit is the bound origin token and the exact base units the permit
+    // authorizes, which is the same `value` the permit carries. The
+    // destination is the bound chain and resolved recipient. Both are
+    // required: the Broker enforces the wallet's `allowed_destinations`
+    // against the declared destination, and the owner's approval page renders
+    // the amount and recipient from these fields rather than from `action`.
+    // Declaring the recipient is what makes the caller-selected
+    // `destination.recipient` subject to policy instead of bypassing it.
+    //
+    // The fee is `none` because the `gasless.relay` class has no fee asset.
+    let claim = json!({
+        "package_hash": package_hash,
+        "route": route,
+        "operation_class": "gasless.relay",
+        "crypto_suite": "secp256k1-keccak256-recoverable",
+        "payload_digest": hex::encode(payload_digest),
+        "ordered_hashes": [hex::encode(payload.hash)],
+        "declared_debits": [{
+            "asset": {
+                "chain": state.request.origin.chain,
+                "asset": state.request.origin.currency
+            },
+            "amount": state.amount_units
+        }],
+        "declared_destinations": [{
+            "chain": state.request.destination.chain,
+            "destination": recipient
+        }],
+        "declared_fee": {"kind": "none"},
+        "nonce": hex::encode(&nonce[..CLAIM_NONCE_BYTES]),
+        "claim_assurance": {"kind": "machine_asserted"}
+    });
+    let approval_hint = state.approval.as_ref().and_then(|approval| {
+        let unexpired = approval
+            .get("expires_ms")
+            .and_then(Value::as_u64)
+            .is_some_and(|expires_ms| expires_ms > host.now_ms().unwrap_or(0));
+        unexpired
+            .then(|| {
+                approval
+                    .get("action_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .flatten()
+    });
+    let signature = match host.sign_payload(&PayloadSignRequest {
         wallet: wallet.clone(),
-        hash32,
-        purpose: "gasless.relay".into(),
+        preimage: payload.preimage,
+        claimed_hash: payload.hash.into(),
+        signature_algorithm: "secp256k1-keccak256-recoverable".into(),
+        operation_class: "gasless.relay".into(),
+        petal_use_claim_jcs: match serde_jcs::to_vec(&claim) {
+            Ok(claim) => claim,
+            Err(error) => return backend(format!("cannot encode signing claim: {error}")),
+        },
+        claim_assurance_evidence: None,
+        approval_hint,
+        action: serde_json::to_vec(&state.sign).ok(),
+        advisory: None,
+        selector: SignSelector::Exact,
+        key_ref_jcs: None,
     }) {
-        Ok(SignHashOutcome::Signature(bytes)) => match signature_hex(bytes) {
+        Ok(SignOutcome::Signature(bytes)) => match signature_hex(bytes) {
             Ok(signature) => signature,
             Err(error) => return error,
         },
-        Ok(SignHashOutcome::ApprovalRequired {
+        Ok(SignOutcome::ApprovalPending {
             action_id,
-            ceremony_url,
             expires_ms,
         }) => {
             let retry_write_body = retry_write_body(&state);
             state.phase = "approval_required".into();
             state.approval = Some(json!({
                 "action_id": action_id,
-                "ceremony_url": ceremony_url,
                 "expires_ms": expires_ms,
                 "retry_write_body": retry_write_body
             }));
@@ -868,7 +992,7 @@ fn gasless_transaction_with_host<H: Host>(
                 return error;
             }
             return denied(format!(
-                "review the Relay route and required minimum output, approve it, then retry the exact write: {}",
+                "review the Relay route and required minimum output in Bloom's owner-visible signing request, approve it, then retry the exact write: {}",
                 compact(state.approval.as_ref().unwrap())
             ));
         }
@@ -905,6 +1029,13 @@ fn gasless_transaction_with_host<H: Host>(
         return error;
     }
     DispatchResponse::Write
+}
+
+fn route_id(ctx: &petal::Ctx) -> Result<&str, DispatchResponse> {
+    ctx.params
+        .iter()
+        .find_map(|(name, value)| (name == "bloom.route_id").then_some(value.as_str()))
+        .ok_or_else(|| backend("trusted Petal route id is unavailable"))
 }
 
 fn attempted_submission(phase: &str) -> bool {
@@ -996,7 +1127,7 @@ fn next_action(state: &RelayTransactionState, status: &str) -> Value {
     match status {
         "approval_required" => json!({
             "action": "review_route_then_approve",
-            "instruction": "Review the exact origin, destination, recipient, quote, and minimum output; open approval.ceremony_url; then retry the exact write body.",
+            "instruction": "Review the exact origin, destination, recipient, quote, and minimum output in Bloom's owner-visible signing request; approve it, then retry the exact write body.",
             "retry_write_body": retry_write_body(state)
         }),
         "approval_expired" => json!({
@@ -1113,7 +1244,7 @@ fn gasless_transaction_status_with_host<H: Host>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::signing_hash;
+    use crate::common::signing_payload;
     use crate::common::test_helpers::{MockHost, approval, signature};
 
     const WALLET: &str = "0x03508bb71268bba25ecacc8f620e01866650532c";
@@ -1243,7 +1374,7 @@ mod tests {
         assert_eq!(state.request.origin.chain, "base");
         assert_eq!(state.request.destination.chain, "optimism");
         assert_eq!(state.quote["required_minimum_out_units"], "97000000");
-        assert!(signing_hash(&state.sign).is_ok());
+        assert!(signing_payload(&state.sign).is_ok());
     }
 
     #[test]
@@ -1313,6 +1444,41 @@ mod tests {
     }
 
     #[test]
+    fn chain_slugs_must_start_with_a_lowercase_letter() {
+        // The slug is declared to the Broker as a protocol token.
+        assert!(normalize_chain("base", "destination.chain").is_ok());
+        assert!(normalize_chain("arbitrum-nova", "destination.chain").is_ok());
+        assert!(normalize_chain("1inch", "destination.chain").is_err());
+    }
+
+    #[test]
+    fn a_checksummed_recipient_is_bound_in_lowercase() {
+        // The claim declares whatever `bind_request` stored, and the Broker
+        // matches `allowed_destinations` byte-exactly. A caller passing an
+        // EIP-55 address must still produce the lowercase destination the
+        // wallet policy is written against.
+        let mut input = request();
+        input.destination.recipient = Some("0x48Aae23Db69ACae2DA2F6bF43Ec5eB1996Cb1245".into());
+        let (bound, _, _) = bind_request(input, WALLET).unwrap();
+        assert_eq!(
+            bound.destination.recipient.as_deref(),
+            Some("0x48aae23db69acae2da2f6bf43ec5eb1996cb1245")
+        );
+    }
+
+    #[test]
+    fn a_non_evm_recipient_keeps_its_case() {
+        // Base58 is case-significant, so lowercasing would name a different
+        // account. The Broker matches `allowed_destinations` byte-exactly, so
+        // the claim must carry the recipient exactly as the caller wrote it.
+        const SOLANA: &str = "FT23ewccKxfccjYoomz6CygaDqxPYjzx3xaEzMLJT92x";
+        let mut input = request();
+        input.destination.recipient = Some(SOLANA.into());
+        let (bound, _, _) = bind_request(input, WALLET).unwrap();
+        assert_eq!(bound.destination.recipient.as_deref(), Some(SOLANA));
+    }
+
+    #[test]
     fn full_lifecycle_reuses_the_quote_and_reconciles_success() {
         let mut host = MockHost {
             now_ms: 1_000_000,
@@ -1339,8 +1505,50 @@ mod tests {
             request(),
         );
         assert_eq!(retry, DispatchResponse::Write);
-        assert_eq!(host.sign_requests[0].purpose, "gasless.relay");
-        assert_eq!(host.sign_requests[0].hash32, host.sign_requests[1].hash32);
+        assert_eq!(host.sign_requests[0].operation_class, "gasless.relay");
+        assert_eq!(
+            host.sign_requests[0].claimed_hash,
+            host.sign_requests[1].claimed_hash
+        );
+        assert_eq!(
+            host.sign_requests[0].preimage,
+            host.sign_requests[1].preimage
+        );
+        assert_eq!(
+            host.sign_requests[1].approval_hint.as_deref(),
+            Some("approval-1")
+        );
+        // The owner's approval page is rendered from the claim, so it must
+        // declare the permit's real debit: the bound origin token and the
+        // exact base units the permit carries.
+        let claim: Value = serde_json::from_slice(&host.sign_requests[0].petal_use_claim_jcs)
+            .expect("claim is JSON");
+        assert_eq!(
+            claim["declared_debits"],
+            json!([{
+                "asset": {"chain": "base", "asset": BASE_USDC},
+                "amount": "100000000"
+            }])
+        );
+        assert_eq!(
+            claim["declared_debits"][0]["amount"],
+            json!(bound_request().1)
+        );
+        // The recipient must be declared: a gasless transfer never stages an
+        // outbox entry, so this claim is the only place the Broker can enforce
+        // the wallet's allowed_destinations against a caller-chosen recipient.
+        assert_eq!(
+            claim["declared_destinations"],
+            json!([{"chain": "optimism", "destination": WALLET}])
+        );
+        assert_eq!(claim["declared_fee"], json!({"kind": "none"}));
+        let nonce = claim["nonce"].as_str().expect("nonce is hex");
+        assert_eq!(nonce.len(), CLAIM_NONCE_BYTES * 2, "{nonce}");
+        assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            host.sign_requests[0].petal_use_claim_jcs,
+            host.sign_requests[1].petal_use_claim_jcs
+        );
         assert_eq!(
             host.requests
                 .iter()
