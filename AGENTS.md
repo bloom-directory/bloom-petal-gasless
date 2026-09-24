@@ -131,7 +131,7 @@ Every read returns a JSON object with:
 - `quote` — Relay's quote details (amounts, fees, timing, permit expiry)
 - `approval` — `action_id`, `expires_ms`, and `retry_write_body` (only when
   `approval_required`). The ceremony link is Bloom's, not the Petal's: read
-  `/bloom/petal-signing-requests/<action_id>.json` for `ceremony_url`.
+  `/petal-signing-requests/<action_id>.json` for `ceremony_url`.
 - `submission` — `"accepted"` or `"unknown"` (after signing)
 - `relay` — projected Relay status with tx hashes (after submission)
 
@@ -139,7 +139,7 @@ Every read returns a JSON object with:
 
 | `next.action` | When | What to do |
 |---|---|---|
-| `review_route_then_approve` | `approval_required` | Review origin/destination/amount/output. Read `/bloom/petal-signing-requests/<approval.action_id>.json` and open its `ceremony_url`. After approval, retry the exact `next.retry_write_body`. |
+| `review_route_then_approve` | `approval_required` | Review origin/destination/amount/output. Read `/petal-signing-requests/<approval.action_id>.json` and open its `ceremony_url`. After approval, retry the exact `next.retry_write_body`. |
 | `retry_write` | `approval_expired` or unknown status | Retry the write with `next.retry_write_body` to get a fresh ceremony or re-attempt signing. |
 | `create_new_transaction` | `quote_expired` | This ID is dead. Create a new transaction with a new ID. |
 | `poll` | `submitting` through `delayed` | Read again later. Only Relay `success` means done. |

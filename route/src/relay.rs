@@ -1452,6 +1452,33 @@ mod tests {
     }
 
     #[test]
+    fn a_checksummed_recipient_is_bound_in_lowercase() {
+        // The claim declares whatever `bind_request` stored, and the Broker
+        // matches `allowed_destinations` byte-exactly. A caller passing an
+        // EIP-55 address must still produce the lowercase destination the
+        // wallet policy is written against.
+        let mut input = request();
+        input.destination.recipient = Some("0x48Aae23Db69ACae2DA2F6bF43Ec5eB1996Cb1245".into());
+        let (bound, _, _) = bind_request(input, WALLET).unwrap();
+        assert_eq!(
+            bound.destination.recipient.as_deref(),
+            Some("0x48aae23db69acae2da2f6bf43ec5eb1996cb1245")
+        );
+    }
+
+    #[test]
+    fn a_non_evm_recipient_keeps_its_case() {
+        // Base58 is case-significant, so lowercasing would name a different
+        // account. The Broker matches `allowed_destinations` byte-exactly, so
+        // the claim must carry the recipient exactly as the caller wrote it.
+        const SOLANA: &str = "FT23ewccKxfccjYoomz6CygaDqxPYjzx3xaEzMLJT92x";
+        let mut input = request();
+        input.destination.recipient = Some(SOLANA.into());
+        let (bound, _, _) = bind_request(input, WALLET).unwrap();
+        assert_eq!(bound.destination.recipient.as_deref(), Some(SOLANA));
+    }
+
+    #[test]
     fn full_lifecycle_reuses_the_quote_and_reconciles_success() {
         let mut host = MockHost {
             now_ms: 1_000_000,
