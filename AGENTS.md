@@ -5,12 +5,13 @@
 | Route | Read | Write |
 |---|---|---|
 | `/petals/gasless/status.json` | Health + capability info (no side effects) | — |
-| `/petals/gasless/transactions/<wallet>/<id>.json` | Transaction state + `next` action | Create or advance transaction |
+| `/petals/gasless/transactions/<wallet>/<index>/<id>.json` | Transaction state + `next` action | Create or advance transaction |
 
-`<wallet>` is a Bloom wallet alias, never an address. The Petal is wallet-scoped
-and acts for account 0: it reads the EVM address from
-`wallets/<wallet>/0/address.evm` for Relay and retains the alias for Bloom
-signing. A wallet without that leaf is refused with an error naming the path.
+`<wallet>` is a Bloom wallet alias, never an address, and `<index>` is the
+wallet's HD account number; Bloom authenticates the pair before the route runs.
+The Petal acts for exactly that account: it reads the EVM address from
+`wallets/<wallet>/<index>/address.evm` for Relay and signs with that account's
+key. An account without that leaf is refused with an error naming the path.
 `<id>` is a caller-defined,
 durable idempotency key (alphanumeric, `-`, `_`, `.`, max 128 chars).
 
@@ -186,7 +187,7 @@ Never expose or persist a wallet signature. Treat permit-submission transport
 errors as opaque — Relay requires the signature in the request URL, so error
 bodies may contain replayable signatures.
 
-Durable initialization is atomic and scoped to `<wallet>/<id>`. Approval
+Durable initialization is atomic and scoped to `<wallet>/<index>/<id>`. Approval
 retries retain the original Relay request ID, signing hash, and exact route.
 Attempted submissions remain readable and reconcile through Relay even after
 local or permit expiry. A write only means Relay accepted the permit

@@ -1159,7 +1159,11 @@ fn next_action(state: &RelayTransactionState, status: &str) -> Value {
     }
 }
 
-pub fn gasless_transaction_status(wallet: &str, id: &str) -> DispatchResponse {
+pub fn gasless_transaction_status(wallet: &str, index: u32, id: &str) -> DispatchResponse {
+    // Bloom keeps this Petal's store per account, so the state read here is
+    // the selected account's; the index is part of the route contract and is
+    // validated at the route, not consulted again.
+    let _ = index;
     gasless_transaction_status_with_host(&mut BloomHost, wallet, id)
 }
 
