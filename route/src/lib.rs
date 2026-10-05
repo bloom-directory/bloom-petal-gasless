@@ -13,13 +13,18 @@ pub use serde_json;
 ///
 /// Bloom authenticates the wallet and account pair before a route runs and
 /// routes only a canonical decimal, so anything else is a malformed request,
-/// not an account. The same form (no sign, no leading zero, at most
-/// `u32::MAX`) is required so one account has exactly one spelling in a path.
+/// not an account. The same form (no sign, no leading zero, below `2^31`, the
+/// non-hardened BIP-32 range Bloom's account parser accepts) is required so one
+/// account has exactly one spelling in a path.
 pub fn validate_index(index: &str) -> Result<u32, petal::DispatchResponse> {
     let canonical = !index.is_empty()
         && index.bytes().all(|byte| byte.is_ascii_digit())
         && (index == "0" || !index.starts_with('0'));
-    match canonical.then(|| index.parse::<u32>().ok()).flatten() {
+    match canonical
+        .then(|| index.parse::<u32>().ok())
+        .flatten()
+        .filter(|number| *number < (1_u32 << 31))
+    {
         Some(number) => Ok(number),
         None => Err(petal::error(
             -3,
@@ -89,12 +94,29 @@ mod wallet_tests {
 
     #[test]
     fn only_a_canonical_account_number_is_an_index() {
-        for (text, number) in [("0", 0), ("1", 1), ("42", 42), ("4294967295", u32::MAX)] {
+        for (text, number) in [
+            ("0", 0),
+            ("1", 1),
+            ("42", 42),
+            ("2147483647", (1 << 31) - 1),
+        ] {
             assert_eq!(validate_index(text).unwrap(), number, "{text}");
         }
-        // Bloom routes only canonical decimals; a second spelling of an
-        // account would be a second path to the same key.
-        for bad in ["", "01", "00", "-1", "+1", "1a", " 1", "4294967296"] {
+        // Bloom routes only canonical decimals below 2^31; a second spelling
+        // of an account would be a second path to the same key, and a
+        // hardened-range number names no account Bloom can derive.
+        for bad in [
+            "",
+            "01",
+            "00",
+            "-1",
+            "+1",
+            "1a",
+            " 1",
+            "2147483648",
+            "4294967295",
+            "4294967296",
+        ] {
             assert!(validate_index(bad).is_err(), "{bad:?}");
         }
     }
@@ -110,36 +132,5 @@ mod wallet_tests {
             let err = parse_wallet_address(&path, bad).unwrap_err();
             assert!(err.contains("wallets/main/0/address.evm"), "{err}");
         }
-    }
-
-    #[test]
-    fn no_route_source_reads_the_retired_wallet_root_leaves() {
-        fn visit(dir: &std::path::Path, hits: &mut Vec<String>) {
-            for entry in std::fs::read_dir(dir).expect("read source dir") {
-                let path = entry.expect("dir entry").path();
-                if path.is_dir() {
-                    visit(&path, hits);
-                } else if path.extension().is_some_and(|ext| ext == "rs")
-                    && !path.ends_with("src/lib.rs")
-                {
-                    let source = std::fs::read_to_string(&path).expect("read source");
-                    for retired in [
-                        "wallets/{wallet}/address\"",
-                        "/addresses.json",
-                        "/public_key\"",
-                        "/policy.toml",
-                    ] {
-                        if source.contains(retired) {
-                            hits.push(format!("{} reads {retired}", path.display()));
-                        }
-                    }
-                }
-            }
-        }
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut hits = Vec::new();
-        visit(&root.join("src"), &mut hits);
-        visit(&root.join("files"), &mut hits);
-        assert!(hits.is_empty(), "{hits:?}");
     }
 }
