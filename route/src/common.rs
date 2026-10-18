@@ -204,6 +204,7 @@ pub(crate) fn signature_hex(mut bytes: Vec<u8>) -> Result<String, DispatchRespon
 pub(crate) struct SigningPayload {
     pub(crate) preimage: Vec<u8>,
     pub(crate) hash: B256,
+    pub(crate) review: Vec<u8>,
 }
 
 pub(crate) fn signing_payload(sign: &Value) -> Result<SigningPayload, DispatchResponse> {
@@ -227,13 +228,14 @@ pub(crate) fn signing_payload(sign: &Value) -> Result<SigningPayload, DispatchRe
             .cloned()
             .ok_or_else(|| backend("Relay typed data omitted its authorization type"))?,
     );
-    let typed: TypedData = serde_json::from_value(json!({
+    let typed_data = json!({
         "types": types,
         "primaryType": primary_type,
         "domain": sign.get("domain"),
         "message": sign.get("value")
-    }))
-    .map_err(|error| backend(format!("invalid Relay typed data: {error}")))?;
+    });
+    let typed: TypedData = serde_json::from_value(typed_data.clone())
+        .map_err(|error| backend(format!("invalid Relay typed data: {error}")))?;
     let mut preimage = Vec::with_capacity(66);
     preimage.extend_from_slice(&[0x19, 0x01]);
     preimage.extend_from_slice(typed.domain().separator().as_slice());
@@ -244,7 +246,15 @@ pub(crate) fn signing_payload(sign: &Value) -> Result<SigningPayload, DispatchRe
             .as_slice(),
     );
     let hash = B256::from_slice(&Keccak256::digest(&preimage));
-    Ok(SigningPayload { preimage, hash })
+    let review = serde_json::to_vec(&json!({
+        "schema":"bloom.message.review.v1", "kind":"eip712", "typed_data":typed_data
+    }))
+    .map_err(|error| backend(format!("cannot encode signing review: {error}")))?;
+    Ok(SigningPayload {
+        preimage,
+        hash,
+        review,
+    })
 }
 
 // ---------------------------------------------------------------------------

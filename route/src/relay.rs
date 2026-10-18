@@ -968,7 +968,7 @@ fn gasless_transaction_with_context<H: Host>(
         },
         claim_assurance_evidence: None,
         approval_hint,
-        action: serde_json::to_vec(&state.sign).ok(),
+        action: Some(payload.review),
         advisory: None,
         selector: SignSelector::Exact,
         key_ref_jcs: None,
