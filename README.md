@@ -19,11 +19,21 @@ that account: it reads its EVM address from `wallets/<wallet>/<index>/address.ev
 and signs with its key. `<id>` is a caller-chosen idempotency key
 (alphanumeric, `-`, `_`, `.`, max 128 chars).
 
+## Upgrading from v0.1.1
+
+Before switching packages, use the installed v0.1.1 package to read every
+non-terminal transaction to a terminal Relay status. Keep its package and
+private records until reconciliation completes: the new account stores do not
+import the old package-level records, including Relay request IDs for funded
+transactions. A new transaction ID can otherwise spend again while the first
+request still settles or refunds.
+
 ## Supported Origin Tokens
 
 Only native USDC contracts that implement EIP-3009 work as **origin** currencies.
-Other tokens (e.g. USDT) use Permit2 and are rejected. All six USDC variants
-below route to each other in every combination (same-chain and cross-chain).
+Other origin tokens (e.g. USDT) are rejected. Each same-chain or cross-chain
+route requires a valid Relay quote; this list does not establish funded
+settlement for every pair.
 
 | Chain | Chain ID | USDC Address | Decimals | Permit Domain |
 |---|---|---|---|---|
