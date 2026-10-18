@@ -1510,6 +1510,17 @@ mod tests {
         );
         assert_eq!(retry, DispatchResponse::Write);
         assert_eq!(host.sign_requests[0].operation_class, "gasless.relay");
+        let review: Value =
+            serde_json::from_slice(host.sign_requests[0].action.as_ref().unwrap()).unwrap();
+        assert_eq!(review["schema"], "bloom.message.review.v1");
+        assert_eq!(review["kind"], "eip712");
+        let typed: alloy_dyn_abi::eip712::TypedData =
+            serde_json::from_value(review["typed_data"].clone()).unwrap();
+        let mut reviewed = vec![0x19, 0x01];
+        reviewed.extend_from_slice(typed.domain().separator().as_slice());
+        reviewed.extend_from_slice(typed.hash_struct().unwrap().as_slice());
+        assert_eq!(reviewed, host.sign_requests[0].preimage);
+        assert_eq!(host.sign_requests[0].action, host.sign_requests[1].action);
         assert_eq!(
             host.sign_requests[0].claimed_hash,
             host.sign_requests[1].claimed_hash
