@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Install the tested Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --target wasm32-unknown-unknown
+          rustup default 1.98.1
+      - name: Format
+        run: cargo fmt --manifest-path route/Cargo.toml --check
+      - name: Tests and Clippy
+        run: |
+          cargo test --manifest-path route/Cargo.toml --locked
+          cargo clippy --manifest-path route/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Route architecture
+        run: bash scripts/check-route-architecture.sh
+      - name: Build and validate every route component and package
+        run: |
+          cargo install wasm-tools --version 1.255.0 --locked
+          bash scripts/build.sh
+          target/petal-tool/bin/petal check --root .
+          target/petal-tool/bin/petal package --root . --out "$RUNNER_TEMP/gasless.petal.tar.gz"
