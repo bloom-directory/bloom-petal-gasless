@@ -9,22 +9,37 @@ origin chain's native gas token is never required.
 | Route | Method | Purpose |
 |---|---|---|
 | `/petals/gasless/status.json` | Read | Health check and capability info |
-| `/petals/gasless/transactions/<wallet>/<id>.json` | Read | Query transaction state |
-| `/petals/gasless/transactions/<wallet>/<id>.json` | Write | Create or advance a transaction |
+| `/petals/gasless/transactions/<wallet>/<index>/<id>.json` | Read | Query transaction state |
+| `/petals/gasless/transactions/<wallet>/<index>/<id>.json` | Write | Create or advance a transaction |
 
-`<wallet>` is a Bloom wallet alias. `<id>` is a caller-chosen idempotency key
+`<wallet>` is a Bloom wallet alias, never an address, and `<index>` is the
+wallet's HD account number; Bloom authenticates the pair before the route runs
+and lists the existing wallets and accounts itself. The Petal acts for exactly
+that account: it reads its EVM address from `wallets/<wallet>/<index>/address.evm`
+and signs with its key. `<id>` is a caller-chosen idempotency key
 (alphanumeric, `-`, `_`, `.`, max 128 chars).
+
+## Upgrading from v0.1.1
+
+Before switching packages, use the installed v0.1.1 package to read every
+non-terminal transaction to a terminal Relay status. Keep its package and
+private records until reconciliation completes: the new account stores do not
+import the old package-level records, including Relay request IDs for funded
+transactions. A new transaction ID can otherwise spend again while the first
+request still settles or refunds.
 
 ## Supported Origin Tokens
 
 Only native USDC contracts that implement EIP-3009 work as **origin** currencies.
-Other tokens (e.g. USDT) use Permit2 and are rejected. All five USDC variants
-below route to each other in every combination (same-chain and cross-chain).
+Other origin tokens (e.g. USDT) are rejected. Each same-chain or cross-chain
+route requires a valid Relay quote; this list does not establish funded
+settlement for every pair.
 
 | Chain | Chain ID | USDC Address | Decimals | Permit Domain |
 |---|---|---|---|---|
 | ethereum | 1 | `0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48` | 6 | `{"name":"USD Coin","version":"2"}` |
 | base | 8453 | `0x833589fcd6edb6e08f4c7c32d4f71b54bda02913` | 6 | `{"name":"USD Coin","version":"2"}` |
+| arbitrum | 42161 | `0xaf88d065e77c8cc2239327c5edb3a432268e5831` | 6 | `{"name":"USD Coin","version":"2"}` |
 | optimism | 10 | `0x0b2c639c533813f4aa9d7837caf62653d097ff85` | 6 | `{"name":"USD Coin","version":"2"}` |
 | polygon | 137 | `0x3c499c542cef5e3811e1192ce70d8cc03d5c3359` | 6 | `{"name":"USD Coin","version":"2"}` |
 | avalanche | 43114 | `0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e` | 6 | `{"name":"USD Coin","version":"2"}` |
@@ -37,7 +52,7 @@ EIP-3009 EVM token from the table above.
 
 ```sh
 bloom vfs write \
-  /petals/gasless/transactions/<wallet>/<id>.json \
+  /petals/gasless/transactions/<wallet>/<index>/<id>.json \
   --data '{
     "origin": {
       "chain": "base",
@@ -133,7 +148,7 @@ Hyperliquid petal; gasless handles only the generic permit flow.
 Read the transaction to check its status and next action:
 
 ```sh
-bloom vfs cat /petals/gasless/transactions/<wallet>/<id>.json
+bloom vfs cat /petals/gasless/transactions/<wallet>/<index>/<id>.json
 ```
 
 ### Statuses
@@ -142,7 +157,7 @@ bloom vfs cat /petals/gasless/transactions/<wallet>/<id>.json
 |---|---|---|
 | `not_created` | No transaction at this ID. Response includes a write template. | Write to create. |
 | `awaiting_signature` | Quote accepted; next write will attempt signing. | Retry write to sign. |
-| `approval_required` | Bloom needs the wallet owner's approval. | Open `approval.ceremony_url`, approve, then retry the exact write body from `next.retry_write_body`. |
+| `approval_required` | Bloom needs the wallet owner's approval. | Read `/petal-signing-requests/<approval.action_id>.json` for the `ceremony_url`, have the owner approve it, then retry the exact write body from `next.retry_write_body`. |
 | `approval_expired` | The approval ceremony timed out. | Retry the write to get a fresh ceremony (same Relay request). |
 | `quote_expired` | The Relay permit's `validBefore` has passed. | Use a **new** transaction ID; the petal never silently re-quotes. |
 | `submitting` | Signing succeeded; permit is being submitted to Relay. | Poll by reading again. |
@@ -160,8 +175,38 @@ bloom vfs cat /petals/gasless/transactions/<wallet>/<id>.json
   wallet, route, amount, and minimum output. A retry with different parameters
   is rejected.
 - **Approval**: when `approval_required`, the write is denied but state is
-  persisted. Complete the ceremony URL, then retry the **exact same write**.
-  The petal retains the same Relay request ID and signing hash across retries.
+  persisted. `approval.action_id` is Bloom's public id for the pending
+  signing request; the owner-facing ceremony link lives in Bloom's projection
+  at `/petal-signing-requests/<action_id>.json` (`ceremony_url`), never
+  in the Petal's own state. Complete the ceremony, then retry the **exact same
+  write**. The petal retains the same Relay request ID and signing hash across
+  retries.
+- **The recipient must be allowed by wallet policy**: the signing claim
+  declares the destination chain and resolved recipient, and Bloom refuses to
+  sign a destination outside the wallet's `allowed_destinations`. A gasless
+  transfer never stages an outbox entry, so this claim is the only place that
+  check can happen. Add the recipient before the first transfer, including
+  when it is the wallet's own address on the destination chain.
+- **Match the policy entry to what the claim declares**: Bloom compares
+  `allowed_destinations` byte for byte, so the entry has to be the exact
+  string this Petal binds. For an EVM address that string is lowercase — you
+  may pass any case, including EIP-55 checksum form, because a `0x` recipient
+  is lowercased when the request is bound, so write the policy entry
+  lowercase. For a non-EVM recipient, such as a base58 address, binding
+  preserves the string byte for byte, so copy the resolved recipient into
+  policy with its case intact; lowercasing it there produces a different
+  address and guarantees denial. A mismatch fails closed, but only at signing,
+  after the owner has already approved a ceremony showing the expected
+  recipient.
+- **Use Relay's canonical chain slug** in both the write body and the policy
+  entry. The claim declares the slug you send, and Bloom matches it exactly,
+  so an alias or a numeric chain ID in either place will not match.
+- **What the owner sees**: the approval page shows the permit's debit and its
+  destination as the Petal declares them: the exact origin amount in base
+  units, the origin token contract and chain, and the recipient with its
+  chain. Bloom labels these figures as claimed, not verified; the minimum
+  output is in the Petal's transaction file, so review it there before
+  approving.
 - **Permit expiry**: if the Relay permit expires before signing, the
   transaction is permanently `quote_expired`. Create a new one with a new ID.
 - **Signatures**: never stored or returned. Transport errors during permit

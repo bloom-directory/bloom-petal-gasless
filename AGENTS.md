@@ -5,25 +5,31 @@
 | Route | Read | Write |
 |---|---|---|
 | `/petals/gasless/status.json` | Health + capability info (no side effects) | — |
-| `/petals/gasless/transactions/<wallet>/<id>.json` | Transaction state + `next` action | Create or advance transaction |
+| `/petals/gasless/transactions/<wallet>/<index>/<id>.json` | Transaction state + `next` action | Create or advance transaction |
 
-`<wallet>` is a Bloom wallet alias — resolve its EVM address through the VFS for
-Relay, but retain the alias for Bloom signing. `<id>` is a caller-defined,
+`<wallet>` is a Bloom wallet alias, never an address, and `<index>` is the
+wallet's HD account number; Bloom authenticates the pair before the route runs.
+The Petal acts for exactly that account: it reads the EVM address from
+`wallets/<wallet>/<index>/address.evm` for Relay and signs with that account's
+key. An account without that leaf is refused with an error naming the path.
+`<id>` is a caller-defined,
 durable idempotency key (alphanumeric, `-`, `_`, `.`, max 128 chars).
 
 ## Supported Origin Tokens
 
-Only these five native USDC contracts implement EIP-3009 and work as origin:
+The Petal supports these six native USDC origin contracts through EIP-3009:
 
 - **ethereum** (1): `0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48`
 - **base** (8453): `0x833589fcd6edb6e08f4c7c32d4f71b54bda02913`
+- **arbitrum** (42161): `0xaf88d065e77c8cc2239327c5edb3a432268e5831`
 - **optimism** (10): `0x0b2c639c533813f4aa9d7837caf62653d097ff85`
 - **polygon** (137): `0x3c499c542cef5e3811e1192ce70d8cc03d5c3359`
 - **avalanche** (43114): `0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e`
 
 All use decimals 6 and permit domain `{"name": "USD Coin", "version": "2"}`.
-All 25 pairs (5 same-chain + 20 cross-chain) are confirmed working. Other
-tokens (USDT, bridged USDC) use Permit2 and are rejected. The destination may
+Route availability requires a valid Relay quote; the supported contract list
+does not establish funded settlement for every same-chain/cross-chain pair.
+Other origin tokens (including USDT and bridged USDC) are rejected. The destination may
 be any Relay-supported chain/currency, including Hyperliquid (chain_id 1337).
 
 ## Write Body
@@ -126,7 +132,9 @@ Every read returns a JSON object with:
   applicable)
 - `request` — the original bound request
 - `quote` — Relay's quote details (amounts, fees, timing, permit expiry)
-- `approval` — ceremony URL and expiry (only when `approval_required`)
+- `approval` — `action_id`, `expires_ms`, and `retry_write_body` (only when
+  `approval_required`). The ceremony link is Bloom's, not the Petal's: read
+  `/petal-signing-requests/<action_id>.json` for `ceremony_url`.
 - `submission` — `"accepted"` or `"unknown"` (after signing)
 - `relay` — projected Relay status with tx hashes (after submission)
 
@@ -134,7 +142,7 @@ Every read returns a JSON object with:
 
 | `next.action` | When | What to do |
 |---|---|---|
-| `review_route_then_approve` | `approval_required` | Review origin/destination/amount/output. Open `approval.ceremony_url`. After approval, retry the exact `next.retry_write_body`. |
+| `review_route_then_approve` | `approval_required` | Review origin/destination/amount/output. Read `/petal-signing-requests/<approval.action_id>.json` and open its `ceremony_url`. After approval, retry the exact `next.retry_write_body`. |
 | `retry_write` | `approval_expired` or unknown status | Retry the write with `next.retry_write_body` to get a fresh ceremony or re-attempt signing. |
 | `create_new_transaction` | `quote_expired` | This ID is dead. Create a new transaction with a new ID. |
 | `poll` | `submitting` through `delayed` | Read again later. Only Relay `success` means done. |
@@ -181,7 +189,7 @@ Never expose or persist a wallet signature. Treat permit-submission transport
 errors as opaque — Relay requires the signature in the request URL, so error
 bodies may contain replayable signatures.
 
-Durable initialization is atomic and scoped to `<wallet>/<id>`. Approval
+Durable initialization is atomic and scoped to `<wallet>/<index>/<id>`. Approval
 retries retain the original Relay request ID, signing hash, and exact route.
 Attempted submissions remain readable and reconcile through Relay even after
 local or permit expiry. A write only means Relay accepted the permit
