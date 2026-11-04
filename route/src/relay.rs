@@ -1000,7 +1000,7 @@ fn public_status(phase: &str, relay_status: Option<&Value>) -> String {
 }
 
 fn effective_local_phase(state: &RelayTransactionState, now_ms: u64) -> String {
-    if attempted_submission(&state.phase) || now_ms == 0 {
+    if attempted_submission(&state.phase) || state.phase == "recovery_required" || now_ms == 0 {
         return state.phase.clone();
     }
     let now_seconds = now_ms / 1_000;
@@ -1334,6 +1334,15 @@ mod tests {
             .unwrap();
         assert_eq!(state.phase, "recovery_required");
         assert_eq!(state.approval.unwrap()["status"], "ambiguous");
+    }
+
+    #[test]
+    fn expired_permit_does_not_hide_unresolved_signing_recovery() {
+        let mut state = prepare(response()).unwrap();
+        state.phase = "recovery_required".into();
+        let phase = effective_local_phase(&state, 2_000_000_000_000);
+        assert_eq!(phase, "recovery_required");
+        assert_eq!(next_action(&state, &phase)["action"], "inspect");
     }
 
     #[test]
