@@ -3,6 +3,7 @@ petal::route_file!(
         "bloom:http",
         "bloom:store",
         "bloom:sign",
+        "bloom:sign.status",
         "bloom:vfs.read",
     ]),
     read: |ctx: &petal::Ctx| {

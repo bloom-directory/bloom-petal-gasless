@@ -80,8 +80,6 @@ struct RelayTransactionState {
     sign: Value,
     quote: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
-    approval: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     submission: Option<String>,
 }
 
@@ -440,7 +438,6 @@ fn prepare_quote(
             "permit_valid_before_unix_seconds": permit_valid_before,
             "provider": "relay"
         }),
-        approval: None,
         submission: None,
     })
 }
@@ -881,30 +878,28 @@ fn gasless_transaction_with_host<H: Host>(
             expires_ms,
         }) => {
             state.phase = "approval_required".into();
-            state.approval = Some(json!({
-                "action_id": action_id, "expires_ms": expires_ms,
-                "retry_write_body": retry_write_body(&state)
-            }));
             if let Err(error) = save(host, &state) {
                 return error;
             }
             return denied(format!(
                 "Sealed Approval required; review the Relay route in Bloom, approve it, then retry the exact write: {}",
-                compact(state.approval.as_ref().unwrap())
+                compact(
+                    &json!({"action_id":action_id, "expires_ms":expires_ms, "retry_write_body":retry_write_body(&state)})
+                )
             ));
         }
         Ok(SigningOutcome::RecoveryRequired { status }) => {
             state.phase = "recovery_required".into();
-            state.approval = Some(json!({"retry_state":"recovery_required", "status":status}));
             if let Err(error) = save(host, &state) {
                 return error;
             }
-            return denied("signing recovery required; inspect this transaction in Bloom");
+            return denied(format!(
+                "signing recovery required ({status}); inspect this transaction in Bloom"
+            ));
         }
         Err(error) => return denied(format!("signing denied: {error}")),
     };
 
-    state.approval = None;
     let body = match serde_json::to_vec(&json!({
         "kind": "eip3009",
         "requestId": state.request_id,
@@ -914,7 +909,6 @@ fn gasless_transaction_with_host<H: Host>(
         Err(error) => return backend(format!("cannot serialize permit body: {error}")),
     };
     state.phase = "submitting".into();
-    state.approval = None;
     if let Err(error) = save(host, &state) {
         return error;
     }
@@ -1008,16 +1002,6 @@ fn effective_local_phase(state: &RelayTransactionState, now_ms: u64) -> String {
         now_seconds.saturating_add(PERMIT_SUBMISSION_MARGIN_SECONDS) >= valid_before
     }) {
         return "quote_expired".into();
-    }
-    if state.phase == "approval_required"
-        && state
-            .approval
-            .as_ref()
-            .and_then(|approval| approval.get("expires_ms"))
-            .and_then(Value::as_u64)
-            .is_some_and(|expires_ms| now_ms >= expires_ms)
-    {
-        return "approval_expired".into();
     }
     state.phase.clone()
 }
@@ -1125,7 +1109,39 @@ fn gasless_transaction_status_with_host<H: Host>(
         None
     };
     let now_ms = host.now_ms().unwrap_or(0);
-    let local_phase = effective_local_phase(&state, now_ms);
+    let mut local_phase = effective_local_phase(&state, now_ms);
+    let mut approval = None;
+    if !attempted_submission(&state.phase) {
+        let outcome = match host.signing_status(wallet, &operation_key(&state)) {
+            Ok(outcome) => outcome,
+            Err(error) => return backend(format!("cannot read signing status: {error}")),
+        };
+        match outcome {
+            Some(SigningOutcome::ApprovalPending {
+                action_id,
+                expires_ms,
+            }) => {
+                if local_phase != "quote_expired" {
+                    local_phase = if now_ms >= expires_ms {
+                        "approval_expired"
+                    } else {
+                        "approval_required"
+                    }
+                    .into();
+                }
+                approval = Some(json!({"action_id":action_id,"expires_ms":expires_ms}));
+            }
+            Some(SigningOutcome::RecoveryRequired { status }) => {
+                local_phase = "recovery_required".into();
+                approval = Some(json!({"retry_state":"recovery_required","status":status}));
+            }
+            Some(SigningOutcome::Signed { .. }) if local_phase != "quote_expired" => {
+                local_phase = "ready_to_submit".into();
+            }
+            None if local_phase == "approval_required" => local_phase = "awaiting_signature".into(),
+            _ => {}
+        }
+    }
     let status = public_status(&local_phase, relay_status.as_ref());
     let next = next_action(&state, &status);
     petal::read_json_value(&json!({
@@ -1137,7 +1153,7 @@ fn gasless_transaction_status_with_host<H: Host>(
         "status": status,
         "request_id": state.request_id,
         "quote": state.quote,
-        "approval": state.approval,
+        "approval": approval,
         "submission": state.submission,
         "relay": relay_status,
         "next": next
@@ -1272,6 +1288,70 @@ mod tests {
     }
 
     #[test]
+    fn status_reads_current_host_authority_without_exposing_signatures_or_writing_state() {
+        let mut host = MockHost {
+            now_ms: 1_000_000,
+            ..MockHost::default()
+        };
+        let mut state = prepare(response()).unwrap();
+        state.id = "status".into();
+        state.phase = "approval_required".into();
+        save(&mut host, &state).unwrap();
+        let original = host.store[&key(&state.wallet, &state.id)].clone();
+        assert!(!String::from_utf8_lossy(&original).contains("approval\":"));
+        for (outcome, expected) in [
+            (
+                SigningOutcome::ApprovalPending {
+                    action_id: "current-owner-action".into(),
+                    expires_ms: 1_100_000,
+                },
+                "approval_required",
+            ),
+            (
+                SigningOutcome::ApprovalPending {
+                    action_id: "expired-owner-action".into(),
+                    expires_ms: 900_000,
+                },
+                "approval_expired",
+            ),
+            (
+                SigningOutcome::RecoveryRequired {
+                    status: "ambiguous".into(),
+                },
+                "recovery_required",
+            ),
+            (
+                SigningOutcome::Signed {
+                    signature: vec![171; 65],
+                },
+                "ready_to_submit",
+            ),
+        ] {
+            host.status_results.push_back(Ok(Some(outcome)));
+            let DispatchResponse::Read(bytes) =
+                gasless_transaction_status_with_host(&mut host, &state.wallet, &state.id)
+            else {
+                panic!("status must be readable")
+            };
+            let public: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(public["status"], expected);
+            assert!(public.get("signature").is_none());
+            assert!(!String::from_utf8_lossy(&bytes).contains("171,171"));
+            assert_eq!(host.store[&key(&state.wallet, &state.id)], original);
+            assert_eq!(
+                host.status_requests.last().unwrap(),
+                &(state.wallet.clone(), operation_key(&state))
+            );
+        }
+        host.status_results
+            .push_back(Err("host unavailable".into()));
+        assert!(matches!(
+            gasless_transaction_status_with_host(&mut host, &state.wallet, &state.id),
+            DispatchResponse::Error { code: -4, .. }
+        ));
+    }
+
+    #[test]
     fn prepared_payment_binds_complete_typed_data_and_exact_debit() {
         let state = prepare(response()).unwrap();
         let action = prepared_action(&state).unwrap();
@@ -1333,7 +1413,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(state.phase, "recovery_required");
-        assert_eq!(state.approval.unwrap()["status"], "ambiguous");
     }
 
     #[test]

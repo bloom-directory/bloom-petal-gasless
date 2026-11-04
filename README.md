@@ -213,11 +213,13 @@ signature. Ambiguous submissions must be reconciled by reading status; another
 write does not sign or submit again.
 
 Covered Trader/Degen authorization requires explicit owner opt-in for the
-reviewed profile and exact installed package. The narrow EIP-3009 profile binds
-the token/domain, signing account, Relay receiver and authorization validity.
-It accounts for the signed token debit; it does not verify Relay settlement,
-quote execution or the destination's economic value. Valid actions outside
-coverage use exact review. Institutional requires individual approval.
+exact installed package. The package declares its exact origin-token debit;
+Broker trusts this installer-signed declaration and applies the generic account,
+network, token-policy and budget checks. The Petal validates the EIP-3009
+payload and Relay route. Generic review binds the displayed typed data to the
+signing bytes; it does not prove destination settlement or economic value.
+Institutional requires individual approval. Status is read from Bloom's
+prepared-signing status API, never a cached private approval record.
 
 Before upgrading from the unnumbered route, reconcile pending operations with
 the installed build and retain its package/private records. This build does not

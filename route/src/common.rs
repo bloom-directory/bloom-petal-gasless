@@ -36,6 +36,11 @@ pub(crate) trait Host {
         action: &PreparedAction,
         operation_key: &str,
     ) -> Result<SigningOutcome, String>;
+    fn signing_status(
+        &mut self,
+        wallet: &str,
+        operation_key: &str,
+    ) -> Result<Option<SigningOutcome>, String>;
     fn now_ms(&mut self) -> Result<u64, String>;
 }
 
@@ -80,6 +85,23 @@ impl Host for BloomHost<'_> {
     ) -> Result<SigningOutcome, String> {
         petal::signing::sign(self.ctx, wallet, action, operation_key)
             .map_err(|error| error.to_string())
+    }
+
+    fn signing_status(
+        &mut self,
+        wallet: &str,
+        operation_key: &str,
+    ) -> Result<Option<SigningOutcome>, String> {
+        match petal::signing::status(self.ctx, wallet, operation_key) {
+            Ok(outcome) => Ok(Some(outcome)),
+            Err(error)
+                if error.code == petal::signing::ErrorCode::Invalid
+                    && error.message == "operation not found" =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     fn now_ms(&mut self) -> Result<u64, String> {
@@ -268,6 +290,8 @@ pub(crate) mod test_helpers {
         pub(crate) store: HashMap<String, Vec<u8>>,
         pub(crate) http_results: VecDeque<Result<HttpResponse, String>>,
         pub(crate) sign_results: VecDeque<Result<SigningOutcome, String>>,
+        pub(crate) status_results: VecDeque<Result<Option<SigningOutcome>, String>>,
+        pub(crate) status_requests: Vec<(String, String)>,
         pub(crate) requests: Vec<HttpRequest>,
         pub(crate) sign_requests: Vec<(String, PreparedAction, String)>,
         pub(crate) now_ms: u64,
@@ -323,6 +347,16 @@ pub(crate) mod test_helpers {
             self.sign_results
                 .pop_front()
                 .expect("unexpected signing request")
+        }
+
+        fn signing_status(
+            &mut self,
+            wallet: &str,
+            operation_key: &str,
+        ) -> Result<Option<SigningOutcome>, String> {
+            self.status_requests
+                .push((wallet.into(), operation_key.into()));
+            self.status_results.pop_front().unwrap_or(Ok(None))
         }
 
         fn now_ms(&mut self) -> Result<u64, String> {
