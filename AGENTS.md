@@ -5,7 +5,7 @@
 | Route | Read | Write |
 |---|---|---|
 | `/petals/gasless/status.json` | Health + capability info (no side effects) | — |
-| `/petals/gasless/transactions/<wallet>/<id>.json` | Transaction state + `next` action | Create or advance transaction |
+| `/petals/gasless/transactions/<wallet>/<index>/<id>.json` | Transaction state + `next` action | Create or advance transaction |
 
 `<wallet>` is a Bloom wallet alias — resolve its EVM address through the VFS for
 Relay, but retain the alias for Bloom signing. `<id>` is a caller-defined,
@@ -126,7 +126,7 @@ Every read returns a JSON object with:
   applicable)
 - `request` — the original bound request
 - `quote` — Relay's quote details (amounts, fees, timing, permit expiry)
-- `approval` — ceremony URL and expiry (only when `approval_required`)
+- `approval` — action ID and expiry when approval is required, or recovery details when signing needs reconciliation
 - `submission` — `"accepted"` or `"unknown"` (after signing)
 - `relay` — projected Relay status with tx hashes (after submission)
 
@@ -134,7 +134,7 @@ Every read returns a JSON object with:
 
 | `next.action` | When | What to do |
 |---|---|---|
-| `review_route_then_approve` | `approval_required` | Review origin/destination/amount/output. Open `approval.ceremony_url`. After approval, retry the exact `next.retry_write_body`. |
+| `review_route_then_approve` | `approval_required` | Review origin/destination/amount/output. Approve `approval.action_id` in Bloom. After approval, retry the exact `next.retry_write_body`. |
 | `retry_write` | `approval_expired` or unknown status | Retry the write with `next.retry_write_body` to get a fresh ceremony or re-attempt signing. |
 | `create_new_transaction` | `quote_expired` | This ID is dead. Create a new transaction with a new ID. |
 | `poll` | `submitting` through `delayed` | Read again later. Only Relay `success` means done. |
@@ -166,7 +166,7 @@ reviewing the transaction for a human should verify the same things:
 | `Relay returned an unsupported EIP-3009 type` | Token uses Permit2 (e.g. USDT) | Use a native USDC contract instead. |
 | `transaction ID already belongs to a different wallet, route, amount, or output constraint` | Tried to change parameters on existing ID | Use a new transaction ID. |
 | `Relay quote permit has expired` | Too much time passed since quoting | Use a new transaction ID. |
-| `permission denied` (after `approval_required`) | Wallet requires ceremony, not yet approved | Open ceremony URL, approve, retry write. |
+| `permission denied` (after `approval_required`) | Wallet requires ceremony, not yet approved | Approve the action in Bloom, retry write. |
 
 ## Hyperliquid
 
@@ -195,3 +195,25 @@ Live quote-only validation is allowed.
 Petals are authored against the `bloom-petal-development` skill:
 https://github.com/bloom-directory/petal/tree/main/skills/bloom-petal-development
 Load it into your agent before extending this Petal.
+
+## Prepared signing and numbered accounts
+
+`<index>` selects the numbered Bloom account, including account 0. The route
+reads `wallets/<wallet>/<index>/address.evm`; each account has separate private
+transaction state. Signing uses the canonical prepared-action API with complete
+EIP-712 input, an exact token debit and a durable operation key bound to the
+transaction and Relay request. Retrying after approval resumes that operation.
+Recovery outcomes stay visible in transaction status. Reads never expose the
+signature. Ambiguous submissions must be reconciled by reading status; another
+write does not sign or submit again.
+
+Covered Trader/Degen authorization requires explicit owner opt-in for the
+reviewed profile and exact installed package. The narrow EIP-3009 profile binds
+the token/domain, signing account, Relay receiver and authorization validity.
+It accounts for the signed token debit; it does not verify Relay settlement,
+quote execution or the destination's economic value. Valid actions outside
+coverage use exact review. Institutional requires individual approval.
+
+Before upgrading from the unnumbered route, reconcile pending operations with
+the installed build and retain its package/private records. This build does not
+import unnumbered state or reinterpret old approvals, even for account 0.

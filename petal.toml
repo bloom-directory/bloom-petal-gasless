@@ -10,7 +10,7 @@ command = "scripts/build.sh"
 outputs = ["petal/gasless"]
 
 [consent]
-summary = "Execute caller-bounded Relay transfers and swaps from permit-compatible EVM tokens without origin gas, with exact route validation and owner approval."
+summary = "Execute caller-bounded Relay transfers and swaps from permit-compatible EVM tokens without origin gas, with exact route validation and prepared owner authorization."
 
 [caps]
 allowed = ["bloom:http", "bloom:store", "bloom:sign", "bloom:vfs.read"]
@@ -22,6 +22,7 @@ methods = ["get", "post"]
 paths = ["/quote/v2", "/execute/permits", "/intents/status/v3"]
 
 [sign]
+economic_effects_schema = 1
 allowed_intents = ["gasless.relay"]
 
 [store]

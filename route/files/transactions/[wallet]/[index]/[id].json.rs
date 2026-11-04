@@ -6,7 +6,7 @@ petal::route_file!(
         "bloom:vfs.read",
     ]),
     read: |ctx: &petal::Ctx| {
-        let wallet = match petal::param(ctx, "wallet").and_then(|value| {
+        let wallet = match petal::wallet_param(ctx).and_then(|value| {
             if petal::is_safe_segment(value) && value.len() <= 128 {
                 Ok(value)
             } else {
@@ -26,13 +26,13 @@ petal::route_file!(
             Ok(id) => id,
             Err(response) => return response,
         };
-        crate::gasless_transaction_status(wallet, id)
+        crate::gasless_transaction_status(ctx, wallet, id)
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {
         if body.len() > 16 * 1024 {
             return petal::error(-3, "request body is too large");
         }
-        let wallet = match petal::param(ctx, "wallet").and_then(|value| {
+        let wallet = match petal::wallet_param(ctx).and_then(|value| {
             if petal::is_safe_segment(value) && value.len() <= 128 {
                 Ok(value.to_owned())
             } else {
@@ -52,7 +52,11 @@ petal::route_file!(
             Ok(id) => id,
             Err(response) => return response,
         };
-        let address = match crate::wallet_address(&wallet) {
+        let index = match petal::param(ctx, "index") {
+            Ok(index) if index.parse::<u32>().is_ok() => index,
+            _ => return petal::error(-3, "invalid account index"),
+        };
+        let address = match crate::wallet_address(&wallet, index) {
             Ok(address) => address,
             Err(response) => return response,
         };
@@ -60,6 +64,6 @@ petal::route_file!(
             Ok(request) => request,
             Err(error) => return petal::error(-3, format!("invalid request JSON: {error}")),
         };
-        crate::gasless_transaction(wallet, address, id, request)
+        crate::gasless_transaction(ctx, wallet, address, id, request)
     },
 );

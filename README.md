@@ -9,8 +9,8 @@ origin chain's native gas token is never required.
 | Route | Method | Purpose |
 |---|---|---|
 | `/petals/gasless/status.json` | Read | Health check and capability info |
-| `/petals/gasless/transactions/<wallet>/<id>.json` | Read | Query transaction state |
-| `/petals/gasless/transactions/<wallet>/<id>.json` | Write | Create or advance a transaction |
+| `/petals/gasless/transactions/<wallet>/<index>/<id>.json` | Read | Query transaction state |
+| `/petals/gasless/transactions/<wallet>/<index>/<id>.json` | Write | Create or advance a transaction |
 
 `<wallet>` is a Bloom wallet alias. `<id>` is a caller-chosen idempotency key
 (alphanumeric, `-`, `_`, `.`, max 128 chars).
@@ -37,7 +37,7 @@ EIP-3009 EVM token from the table above.
 
 ```sh
 bloom vfs write \
-  /petals/gasless/transactions/<wallet>/<id>.json \
+  /petals/gasless/transactions/<wallet>/<index>/<id>.json \
   --data '{
     "origin": {
       "chain": "base",
@@ -133,7 +133,7 @@ Hyperliquid petal; gasless handles only the generic permit flow.
 Read the transaction to check its status and next action:
 
 ```sh
-bloom vfs cat /petals/gasless/transactions/<wallet>/<id>.json
+bloom vfs cat /petals/gasless/transactions/<wallet>/<index>/<id>.json
 ```
 
 ### Statuses
@@ -142,7 +142,7 @@ bloom vfs cat /petals/gasless/transactions/<wallet>/<id>.json
 |---|---|---|
 | `not_created` | No transaction at this ID. Response includes a write template. | Write to create. |
 | `awaiting_signature` | Quote accepted; next write will attempt signing. | Retry write to sign. |
-| `approval_required` | Bloom needs the wallet owner's approval. | Open `approval.ceremony_url`, approve, then retry the exact write body from `next.retry_write_body`. |
+| `approval_required` | Bloom needs the wallet owner's approval. | Approve `approval.action_id` in Bloom, then retry the exact write body from `next.retry_write_body`. |
 | `approval_expired` | The approval ceremony timed out. | Retry the write to get a fresh ceremony (same Relay request). |
 | `quote_expired` | The Relay permit's `validBefore` has passed. | Use a **new** transaction ID; the petal never silently re-quotes. |
 | `submitting` | Signing succeeded; permit is being submitted to Relay. | Poll by reading again. |
@@ -160,7 +160,7 @@ bloom vfs cat /petals/gasless/transactions/<wallet>/<id>.json
   wallet, route, amount, and minimum output. A retry with different parameters
   is rejected.
 - **Approval**: when `approval_required`, the write is denied but state is
-  persisted. Complete the ceremony URL, then retry the **exact same write**.
+  persisted. Approve the action in Bloom, then retry the **exact same write**.
   The petal retains the same Relay request ID and signing hash across retries.
 - **Permit expiry**: if the Relay permit expires before signing, the
   transaction is permanently `quote_expired`. Create a new one with a new ID.
@@ -200,3 +200,25 @@ petal build --root .
 petal check --root .
 bloom petals build .
 ```
+
+## Prepared signing and numbered accounts
+
+`<index>` selects the numbered Bloom account, including account 0. The route
+reads `wallets/<wallet>/<index>/address.evm`; each account has separate private
+transaction state. Signing uses the canonical prepared-action API with complete
+EIP-712 input, an exact token debit and a durable operation key bound to the
+transaction and Relay request. Retrying after approval resumes that operation.
+Recovery outcomes stay visible in transaction status. Reads never expose the
+signature. Ambiguous submissions must be reconciled by reading status; another
+write does not sign or submit again.
+
+Covered Trader/Degen authorization requires explicit owner opt-in for the
+reviewed profile and exact installed package. The narrow EIP-3009 profile binds
+the token/domain, signing account, Relay receiver and authorization validity.
+It accounts for the signed token debit; it does not verify Relay settlement,
+quote execution or the destination's economic value. Valid actions outside
+coverage use exact review. Institutional requires individual approval.
+
+Before upgrading from the unnumbered route, reconcile pending operations with
+the installed build and retain its package/private records. This build does not
+import unnumbered state or reinterpret old approvals, even for account 0.

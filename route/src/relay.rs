@@ -1,12 +1,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use petal::{DispatchResponse, SignHashOutcome, SignRequest};
+use petal::DispatchResponse;
+use petal::signing::{PreparedAction, ReviewArtifact, SigningOutcome, SigningPayload, Spend};
 
 use crate::common::{
     BloomHost, Host, MAX_BODY, MAX_DECIMALS, PERMIT_SUBMISSION_MARGIN_SECONDS,
     RELAY_PERMIT_RECEIVER, ZERO_ADDRESS, backend, compact, denied, fetch, invalid, is_bytes32,
-    is_safe_segment, signature_hex, signing_hash, submit_permit, uint64_value,
+    is_safe_segment, signature_hex, signing_preimage, submit_permit, typed_data, uint64_value,
 };
 
 const SUBMISSION_UNKNOWN: &str =
@@ -752,13 +753,38 @@ fn validate_request_constraints(
     Ok(())
 }
 
+fn operation_key(state: &RelayTransactionState) -> String {
+    format!("relay:{}:{}", state.id, state.request_id)
+}
+
+fn prepared_action(state: &RelayTransactionState) -> Result<PreparedAction, DispatchResponse> {
+    let payload = SigningPayload::keccak256(signing_preimage(&state.sign)?)
+        .map_err(|error| backend(error.to_string()))?;
+    let bytes = serde_json::to_vec(&json!({
+        "schema":"bloom.message.review.v1", "kind":"eip712", "typed_data":typed_data(&state.sign)?
+    }))
+    .map_err(|error| backend(error.to_string()))?;
+    let review = ReviewArtifact::new("bloom.message.review", 1, bytes)
+        .map_err(|error| backend(error.to_string()))?;
+    let spend = Spend::erc20(
+        format!("evm-{}", state.request.origin.chain_id),
+        state.request.origin.currency.to_ascii_lowercase(),
+        state.amount_units.clone(),
+    )
+    .map_err(|error| backend(error.to_string()))?;
+    PreparedAction::new("gasless.relay", payload, review)
+        .map(|action| action.with_spend(spend))
+        .map_err(|error| backend(error.to_string()))
+}
+
 pub fn gasless_transaction(
+    ctx: &petal::Ctx,
     wallet: String,
     address: String,
     id: String,
     request: RelayTransactionRequest,
 ) -> DispatchResponse {
-    gasless_transaction_with_host(&mut BloomHost, wallet, address, id, request)
+    gasless_transaction_with_host(&mut BloomHost { ctx }, wallet, address, id, request)
 }
 
 fn gasless_transaction_with_host<H: Host>(
@@ -786,8 +812,12 @@ fn gasless_transaction_with_host<H: Host>(
             ) {
                 return error;
             }
-            if state.phase == "submitted" {
-                return DispatchResponse::Write;
+            if attempted_submission(&state.phase) {
+                return if state.phase == "submitted" {
+                    DispatchResponse::Write
+                } else {
+                    backend(SUBMISSION_UNKNOWN)
+                };
             }
             state
         }
@@ -836,45 +866,45 @@ fn gasless_transaction_with_host<H: Host>(
     if let Err(error) = ensure_permit_live(host, &state) {
         return error;
     }
-    let hash = match signing_hash(&state.sign) {
-        Ok(hash) => hash,
+    let action = match prepared_action(&state) {
+        Ok(action) => action,
         Err(error) => return error,
     };
-    let mut hash32 = [0_u8; 32];
-    hash32.copy_from_slice(hash.as_slice());
-    let signature = match host.sign_hash(&SignRequest {
-        wallet: wallet.clone(),
-        hash32,
-        purpose: "gasless.relay".into(),
-    }) {
-        Ok(SignHashOutcome::Signature(bytes)) => match signature_hex(bytes) {
+    let operation_key = operation_key(&state);
+    let signature = match host.sign(&wallet, &action, &operation_key) {
+        Ok(SigningOutcome::Signed { signature }) => match signature_hex(signature) {
             Ok(signature) => signature,
             Err(error) => return error,
         },
-        Ok(SignHashOutcome::ApprovalRequired {
+        Ok(SigningOutcome::ApprovalPending {
             action_id,
-            ceremony_url,
             expires_ms,
         }) => {
-            let retry_write_body = retry_write_body(&state);
             state.phase = "approval_required".into();
             state.approval = Some(json!({
-                "action_id": action_id,
-                "ceremony_url": ceremony_url,
-                "expires_ms": expires_ms,
-                "retry_write_body": retry_write_body
+                "action_id": action_id, "expires_ms": expires_ms,
+                "retry_write_body": retry_write_body(&state)
             }));
             if let Err(error) = save(host, &state) {
                 return error;
             }
             return denied(format!(
-                "review the Relay route and required minimum output, approve it, then retry the exact write: {}",
+                "Sealed Approval required; review the Relay route in Bloom, approve it, then retry the exact write: {}",
                 compact(state.approval.as_ref().unwrap())
             ));
+        }
+        Ok(SigningOutcome::RecoveryRequired { status }) => {
+            state.phase = "recovery_required".into();
+            state.approval = Some(json!({"retry_state":"recovery_required", "status":status}));
+            if let Err(error) = save(host, &state) {
+                return error;
+            }
+            return denied("signing recovery required; inspect this transaction in Bloom");
         }
         Err(error) => return denied(format!("signing denied: {error}")),
     };
 
+    state.approval = None;
     let body = match serde_json::to_vec(&json!({
         "kind": "eip3009",
         "requestId": state.request_id,
@@ -996,13 +1026,17 @@ fn next_action(state: &RelayTransactionState, status: &str) -> Value {
     match status {
         "approval_required" => json!({
             "action": "review_route_then_approve",
-            "instruction": "Review the exact origin, destination, recipient, quote, and minimum output; open approval.ceremony_url; then retry the exact write body.",
+            "instruction": "Review the exact origin, destination, recipient, quote, and minimum output; approve the action in Bloom; then retry the exact write body.",
             "retry_write_body": retry_write_body(state)
         }),
         "approval_expired" => json!({
             "action": "retry_write",
             "instruction": "The ceremony expired. Retry this exact write body to obtain a fresh ceremony for the same Relay request.",
             "retry_write_body": retry_write_body(state)
+        }),
+        "recovery_required" => json!({
+            "action": "inspect",
+            "instruction": "Signing requires recovery in Bloom; do not create a replacement transaction until it is reconciled."
         }),
         "quote_expired" => json!({
             "action": "create_new_transaction",
@@ -1028,8 +1062,8 @@ fn next_action(state: &RelayTransactionState, status: &str) -> Value {
     }
 }
 
-pub fn gasless_transaction_status(wallet: &str, id: &str) -> DispatchResponse {
-    gasless_transaction_status_with_host(&mut BloomHost, wallet, id)
+pub fn gasless_transaction_status(ctx: &petal::Ctx, wallet: &str, id: &str) -> DispatchResponse {
+    gasless_transaction_status_with_host(&mut BloomHost { ctx }, wallet, id)
 }
 
 fn gasless_transaction_status_with_host<H: Host>(
@@ -1238,6 +1272,71 @@ mod tests {
     }
 
     #[test]
+    fn prepared_payment_binds_complete_typed_data_and_exact_debit() {
+        let state = prepare(response()).unwrap();
+        let action = prepared_action(&state).unwrap();
+        let review: Value = serde_json::from_slice(&action.review.bytes).unwrap();
+        assert_eq!(review["schema"], "bloom.message.review.v1");
+        assert_eq!(review["kind"], "eip712");
+        assert_eq!(review["typed_data"]["message"], state.sign["value"]);
+        assert_eq!(review["typed_data"]["domain"], state.sign["domain"]);
+        let typed: alloy_dyn_abi::eip712::TypedData =
+            serde_json::from_value(review["typed_data"].clone()).unwrap();
+        assert_eq!(
+            action.payload.hash.as_slice(),
+            typed.eip712_signing_hash().unwrap().as_slice()
+        );
+        assert_eq!(action.payload.preimage.len(), 66);
+        assert_eq!(
+            action.spend,
+            Spend::erc20("evm-8453", state.request.origin.currency, "100000000").unwrap()
+        );
+    }
+
+    #[test]
+    fn operation_identity_survives_reload_and_binds_the_quote() {
+        let mut state = prepare(response()).unwrap();
+        state.id = "stable-id".into();
+        let reloaded: RelayTransactionState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(operation_key(&state), operation_key(&reloaded));
+        assert_eq!(
+            prepared_action(&state).unwrap(),
+            prepared_action(&reloaded).unwrap()
+        );
+        let original = operation_key(&state);
+        state.request_id = format!("0x{}", "cc".repeat(32));
+        assert_ne!(original, operation_key(&state));
+    }
+
+    #[test]
+    fn recovery_required_is_durable_and_does_not_submit() {
+        let mut host = MockHost {
+            now_ms: 1_000_000,
+            ..MockHost::default()
+        };
+        host.push_json(200, response());
+        host.sign_results
+            .push_back(Ok(SigningOutcome::RecoveryRequired {
+                status: "ambiguous".into(),
+            }));
+        let result = gasless_transaction_with_host(
+            &mut host,
+            "minnow-passkey".into(),
+            WALLET.into(),
+            "recovery".into(),
+            request(),
+        );
+        assert!(matches!(result, DispatchResponse::Error { code: -2, .. }));
+        assert_eq!(host.requests.len(), 1);
+        let state = load(&mut host, "minnow-passkey", "recovery")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.phase, "recovery_required");
+        assert_eq!(state.approval.unwrap()["status"], "ambiguous");
+    }
+
+    #[test]
     fn validates_and_hashes_a_generic_relay_route() {
         let state = prepare(response()).unwrap();
         assert_eq!(state.request.origin.chain, "base");
@@ -1339,8 +1438,8 @@ mod tests {
             request(),
         );
         assert_eq!(retry, DispatchResponse::Write);
-        assert_eq!(host.sign_requests[0].purpose, "gasless.relay");
-        assert_eq!(host.sign_requests[0].hash32, host.sign_requests[1].hash32);
+        assert_eq!(host.sign_requests[0].1.operation_class, "gasless.relay");
+        assert_eq!(host.sign_requests[0], host.sign_requests[1]);
         assert_eq!(
             host.requests
                 .iter()
@@ -1515,6 +1614,18 @@ mod tests {
         let stored = String::from_utf8_lossy(stored);
         assert!(!stored.contains("secret"));
         assert!(!stored.contains("transport failed"));
+
+        // A repeated write after an ambiguous send must reconcile, never sign or submit again.
+        let retry = gasless_transaction_with_host(
+            &mut host,
+            "minnow-passkey".into(),
+            WALLET.into(),
+            "ambiguous".into(),
+            request(),
+        );
+        assert_eq!(retry, backend(SUBMISSION_UNKNOWN));
+        assert_eq!(host.sign_requests.len(), 1);
+        assert_eq!(host.requests.len(), 2);
 
         host.push_json(
             200,

@@ -1,12 +1,13 @@
 //! Shared Relay protocol constants, host abstraction, and utilities.
 
 use alloy_dyn_abi::eip712::TypedData;
+#[cfg(test)]
 use alloy_primitives::B256;
 use serde_json::{Map, Value, json};
 
-use petal::{
-    DispatchResponse, HostStatus, HttpRequest, HttpResponse, SdkError, SignHashOutcome, SignRequest,
-};
+use petal::{DispatchResponse, HostStatus, HttpRequest, HttpResponse, SdkError};
+
+use petal::signing::{PreparedAction, SigningOutcome};
 
 pub(crate) const RELAY: &str = "https://api.relay.link";
 pub(crate) const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
@@ -29,13 +30,20 @@ pub(crate) trait Host {
         request: &HttpRequest,
         max_bytes: usize,
     ) -> Result<HttpResponse, String>;
-    fn sign_hash(&mut self, request: &SignRequest) -> Result<SignHashOutcome, String>;
+    fn sign(
+        &mut self,
+        wallet: &str,
+        action: &PreparedAction,
+        operation_key: &str,
+    ) -> Result<SigningOutcome, String>;
     fn now_ms(&mut self) -> Result<u64, String>;
 }
 
-pub(crate) struct BloomHost;
+pub(crate) struct BloomHost<'a> {
+    pub(crate) ctx: &'a petal::Ctx,
+}
 
-impl Host for BloomHost {
+impl Host for BloomHost<'_> {
     fn store_get(&mut self, key: &str, max_bytes: usize) -> Result<Option<Vec<u8>>, String> {
         match petal::sdk::store_get(key, max_bytes) {
             Ok(bytes) => Ok(Some(bytes)),
@@ -64,8 +72,14 @@ impl Host for BloomHost {
         petal::sdk::http_fetch(request, max_bytes).map_err(|error| error.message())
     }
 
-    fn sign_hash(&mut self, request: &SignRequest) -> Result<SignHashOutcome, String> {
-        petal::sdk::sign_hash(request).map_err(|error| error.message())
+    fn sign(
+        &mut self,
+        wallet: &str,
+        action: &PreparedAction,
+        operation_key: &str,
+    ) -> Result<SigningOutcome, String> {
+        petal::signing::sign(self.ctx, wallet, action, operation_key)
+            .map_err(|error| error.to_string())
     }
 
     fn now_ms(&mut self) -> Result<u64, String> {
@@ -199,7 +213,8 @@ pub(crate) fn signature_hex(mut bytes: Vec<u8>) -> Result<String, DispatchRespon
     Ok(format!("0x{}", hex::encode(bytes)))
 }
 
-pub(crate) fn signing_hash(sign: &Value) -> Result<B256, DispatchResponse> {
+/// Normalize Relay's typed data once; both review and signing bytes use it.
+pub(crate) fn typed_data(sign: &Value) -> Result<Value, DispatchResponse> {
     let primary_type = sign
         .get("primaryType")
         .and_then(Value::as_str)
@@ -220,16 +235,23 @@ pub(crate) fn signing_hash(sign: &Value) -> Result<B256, DispatchResponse> {
             .cloned()
             .ok_or_else(|| backend("Relay typed data omitted its authorization type"))?,
     );
-    let typed: TypedData = serde_json::from_value(json!({
-        "types": types,
-        "primaryType": primary_type,
-        "domain": sign.get("domain"),
-        "message": sign.get("value")
-    }))
-    .map_err(|error| backend(format!("invalid Relay typed data: {error}")))?;
-    typed
-        .eip712_signing_hash()
-        .map_err(|error| backend(format!("cannot hash Relay typed data: {error}")))
+    Ok(json!({"types": types, "primaryType": primary_type,
+        "domain": sign.get("domain"), "message": sign.get("value")}))
+}
+
+pub(crate) fn signing_preimage(sign: &Value) -> Result<Vec<u8>, DispatchResponse> {
+    let typed: TypedData = serde_json::from_value(typed_data(sign)?)
+        .map_err(|error| backend(format!("invalid Relay typed data: {error}")))?;
+    let domain = typed.domain.separator();
+    let message = typed
+        .hash_struct()
+        .map_err(|error| backend(format!("cannot hash Relay typed data: {error}")))?;
+    Ok([&[0x19, 0x01][..], domain.as_slice(), message.as_slice()].concat())
+}
+
+#[cfg(test)]
+pub(crate) fn signing_hash(sign: &Value) -> Result<B256, DispatchResponse> {
+    Ok(alloy_primitives::keccak256(signing_preimage(sign)?))
 }
 
 // ---------------------------------------------------------------------------
@@ -245,9 +267,9 @@ pub(crate) mod test_helpers {
     pub(crate) struct MockHost {
         pub(crate) store: HashMap<String, Vec<u8>>,
         pub(crate) http_results: VecDeque<Result<HttpResponse, String>>,
-        pub(crate) sign_results: VecDeque<Result<SignHashOutcome, String>>,
+        pub(crate) sign_results: VecDeque<Result<SigningOutcome, String>>,
         pub(crate) requests: Vec<HttpRequest>,
-        pub(crate) sign_requests: Vec<SignRequest>,
+        pub(crate) sign_requests: Vec<(String, PreparedAction, String)>,
         pub(crate) now_ms: u64,
     }
 
@@ -290,8 +312,14 @@ pub(crate) mod test_helpers {
                 .expect("unexpected HTTP request")
         }
 
-        fn sign_hash(&mut self, request: &SignRequest) -> Result<SignHashOutcome, String> {
-            self.sign_requests.push(request.clone());
+        fn sign(
+            &mut self,
+            wallet: &str,
+            action: &PreparedAction,
+            operation_key: &str,
+        ) -> Result<SigningOutcome, String> {
+            self.sign_requests
+                .push((wallet.into(), action.clone(), operation_key.into()));
             self.sign_results
                 .pop_front()
                 .expect("unexpected signing request")
@@ -302,17 +330,16 @@ pub(crate) mod test_helpers {
         }
     }
 
-    pub(crate) fn approval() -> SignHashOutcome {
-        SignHashOutcome::ApprovalRequired {
+    pub(crate) fn approval() -> SigningOutcome {
+        SigningOutcome::ApprovalPending {
             action_id: "approval-1".into(),
-            ceremony_url: "http://127.0.0.1/approve/approval-1".into(),
             expires_ms: 1_500_000,
         }
     }
 
-    pub(crate) fn signature() -> SignHashOutcome {
+    pub(crate) fn signature() -> SigningOutcome {
         let mut bytes = vec![0xab; 65];
         bytes[64] = 0;
-        SignHashOutcome::Signature(bytes)
+        SigningOutcome::Signed { signature: bytes }
     }
 }
