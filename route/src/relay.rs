@@ -1013,10 +1013,9 @@ fn next_action(state: &RelayTransactionState, status: &str) -> Value {
             "instruction": "Review the exact origin, destination, recipient, quote, and minimum output; approve the action in Bloom; then retry the exact write body.",
             "retry_write_body": retry_write_body(state)
         }),
-        "approval_expired" => json!({
-            "action": "retry_write",
-            "instruction": "The ceremony expired. Retry this exact write body to obtain a fresh ceremony for the same Relay request.",
-            "retry_write_body": retry_write_body(state)
+        "approval_expired" | "approval_cancelled" => json!({
+            "action": "create_new_transaction",
+            "instruction": "This signing operation is terminal. Use a new transaction ID to obtain a fresh quote and owner-reviewed signing operation."
         }),
         "recovery_required" => json!({
             "action": "inspect",
@@ -1114,6 +1113,16 @@ fn gasless_transaction_status_with_host<H: Host>(
     if !attempted_submission(&state.phase) {
         let outcome = match host.signing_status(wallet, &operation_key(&state)) {
             Ok(outcome) => outcome,
+            Err(error) if error.code == petal::signing::ErrorCode::Expired => {
+                local_phase = "approval_expired".into();
+                approval = Some(json!({"retry_state":"expired"}));
+                None
+            }
+            Err(error) if error.code == petal::signing::ErrorCode::Cancelled => {
+                local_phase = "approval_cancelled".into();
+                approval = Some(json!({"retry_state":"cancelled"}));
+                None
+            }
             Err(error) => return backend(format!("cannot read signing status: {error}")),
         };
         match outcome {
@@ -1343,8 +1352,30 @@ mod tests {
                 &(state.wallet.clone(), operation_key(&state))
             );
         }
+        for (code, expected) in [
+            (petal::signing::ErrorCode::Expired, "approval_expired"),
+            (petal::signing::ErrorCode::Cancelled, "approval_cancelled"),
+        ] {
+            host.status_results
+                .push_back(Err(petal::signing::SigningError {
+                    code,
+                    message: "terminal operation".into(),
+                }));
+            let DispatchResponse::Read(bytes) =
+                gasless_transaction_status_with_host(&mut host, &state.wallet, &state.id)
+            else {
+                panic!("terminal state remains readable")
+            };
+            let public: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(public["status"], expected);
+            assert_eq!(public["next"]["action"], "create_new_transaction");
+            assert_eq!(host.store[&key(&state.wallet, &state.id)], original);
+        }
         host.status_results
-            .push_back(Err("host unavailable".into()));
+            .push_back(Err(petal::signing::SigningError {
+                code: petal::signing::ErrorCode::Backend,
+                message: "host unavailable".into(),
+            }));
         assert!(matches!(
             gasless_transaction_status_with_host(&mut host, &state.wallet, &state.id),
             DispatchResponse::Error { code: -4, .. }

@@ -224,3 +224,9 @@ prepared-signing status API, never a cached private approval record.
 Before upgrading from the unnumbered route, reconcile pending operations with
 the installed build and retain its package/private records. This build does not
 import unnumbered state or reinterpret old approvals, even for account 0.
+
+Expired or cancelled prepared signing operations retain their original identity.
+Status reports `approval_expired` or `approval_cancelled` and requests a new
+transaction ID; repeating the same write does not create a fresh ceremony.
+Submitted or ambiguous transactions keep their Relay reconciliation path even
+after local expiry. Never replace one merely because its authorization expired.

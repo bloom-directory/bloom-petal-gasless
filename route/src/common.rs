@@ -7,7 +7,7 @@ use serde_json::{Map, Value, json};
 
 use petal::{DispatchResponse, HostStatus, HttpRequest, HttpResponse, SdkError};
 
-use petal::signing::{PreparedAction, SigningOutcome};
+use petal::signing::{PreparedAction, SigningError, SigningOutcome};
 
 pub(crate) const RELAY: &str = "https://api.relay.link";
 pub(crate) const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
@@ -40,7 +40,7 @@ pub(crate) trait Host {
         &mut self,
         wallet: &str,
         operation_key: &str,
-    ) -> Result<Option<SigningOutcome>, String>;
+    ) -> Result<Option<SigningOutcome>, SigningError>;
     fn now_ms(&mut self) -> Result<u64, String>;
 }
 
@@ -91,7 +91,7 @@ impl Host for BloomHost<'_> {
         &mut self,
         wallet: &str,
         operation_key: &str,
-    ) -> Result<Option<SigningOutcome>, String> {
+    ) -> Result<Option<SigningOutcome>, SigningError> {
         match petal::signing::status(self.ctx, wallet, operation_key) {
             Ok(outcome) => Ok(Some(outcome)),
             Err(error)
@@ -100,7 +100,7 @@ impl Host for BloomHost<'_> {
             {
                 Ok(None)
             }
-            Err(error) => Err(error.to_string()),
+            Err(error) => Err(error),
         }
     }
 
@@ -290,7 +290,7 @@ pub(crate) mod test_helpers {
         pub(crate) store: HashMap<String, Vec<u8>>,
         pub(crate) http_results: VecDeque<Result<HttpResponse, String>>,
         pub(crate) sign_results: VecDeque<Result<SigningOutcome, String>>,
-        pub(crate) status_results: VecDeque<Result<Option<SigningOutcome>, String>>,
+        pub(crate) status_results: VecDeque<Result<Option<SigningOutcome>, SigningError>>,
         pub(crate) status_requests: Vec<(String, String)>,
         pub(crate) requests: Vec<HttpRequest>,
         pub(crate) sign_requests: Vec<(String, PreparedAction, String)>,
@@ -353,7 +353,7 @@ pub(crate) mod test_helpers {
             &mut self,
             wallet: &str,
             operation_key: &str,
-        ) -> Result<Option<SigningOutcome>, String> {
+        ) -> Result<Option<SigningOutcome>, SigningError> {
             self.status_requests
                 .push((wallet.into(), operation_key.into()));
             self.status_results.pop_front().unwrap_or(Ok(None))

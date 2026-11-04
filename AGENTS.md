@@ -135,8 +135,8 @@ Every read returns a JSON object with:
 | `next.action` | When | What to do |
 |---|---|---|
 | `review_route_then_approve` | `approval_required` | Review origin/destination/amount/output. Approve `approval.action_id` in Bloom. After approval, retry the exact `next.retry_write_body`. |
-| `retry_write` | `approval_expired` or unknown status | Retry the write with `next.retry_write_body` to get a fresh ceremony or re-attempt signing. |
-| `create_new_transaction` | `quote_expired` | This ID is dead. Create a new transaction with a new ID. |
+| `retry_write` | Unfinished non-terminal signing | Retry the exact write to resume the same signing operation. |
+| `create_new_transaction` | `quote_expired`, `approval_expired` or `approval_cancelled` | The operation is terminal. Create a fresh transaction with a new ID. |
 | `poll` | `submitting` through `delayed` | Read again later. Only Relay `success` means done. |
 | `complete` | `success` | Settlement confirmed. |
 | `inspect` | `refund` or `failure` | Check `relay.tx_hashes`. Terminal — funds were returned or lost. |
@@ -166,7 +166,7 @@ reviewing the transaction for a human should verify the same things:
 | `Relay returned an unsupported EIP-3009 type` | Token uses Permit2 (e.g. USDT) | Use a native USDC contract instead. |
 | `transaction ID already belongs to a different wallet, route, amount, or output constraint` | Tried to change parameters on existing ID | Use a new transaction ID. |
 | `Relay quote permit has expired` | Too much time passed since quoting | Use a new transaction ID. |
-| `permission denied` (after `approval_required`) | Wallet requires ceremony, not yet approved | Approve the action in Bloom, retry write. |
+| `permission denied` (after `approval_required`) | Wallet requires ceremony, not yet approved | Approve the action in Bloom, then retry the exact write. An expired or cancelled operation requires a new transaction ID. |
 
 ## Hyperliquid
 
@@ -219,3 +219,9 @@ prepared-signing status API, never a cached private approval record.
 Before upgrading from the unnumbered route, reconcile pending operations with
 the installed build and retain its package/private records. This build does not
 import unnumbered state or reinterpret old approvals, even for account 0.
+
+Expired or cancelled prepared signing operations retain their original identity.
+Status reports `approval_expired` or `approval_cancelled` and requests a new
+transaction ID; repeating the same write does not create a fresh ceremony.
+Submitted or ambiguous transactions keep their Relay reconciliation path even
+after local expiry. Never replace one merely because its authorization expired.
