@@ -143,7 +143,8 @@ bloom vfs cat /petals/gasless/transactions/<wallet>/<index>/<id>.json
 | `not_created` | No transaction at this ID. Response includes a write template. | Write to create. |
 | `awaiting_signature` | Quote accepted; next write will attempt signing. | Retry write to sign. |
 | `approval_required` | Bloom needs the wallet owner's approval. | Approve `approval.action_id` in Bloom, then retry the exact write body from `next.retry_write_body`. |
-| `approval_expired` | The approval ceremony timed out. | Retry the write to get a fresh ceremony (same Relay request). |
+| `approval_expired` | The approval ceremony timed out. | Create a new transaction ID for a fresh quote and reviewed signing operation. |
+| `approval_cancelled` | The wallet owner cancelled the approval ceremony. | Create a new transaction ID if you want to request a new reviewed signing operation. |
 | `quote_expired` | The Relay permit's `validBefore` has passed. | Use a **new** transaction ID; the petal never silently re-quotes. |
 | `submitting` | Signing succeeded; permit is being submitted to Relay. | Poll by reading again. |
 | `submission_unknown` | Permit submission hit a transport error. Outcome is ambiguous. | Poll by reading again; Relay may have accepted it. |
