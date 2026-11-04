@@ -91,8 +91,8 @@ be any Relay-supported chain/currency, including Hyperliquid (chain_id 1337).
     │          ▼
     │   ┌─────────────────┐
     │   │ approval_expired│
-    │   │ (retry write →  │
-    │   │  fresh ceremony)│
+    │   │ (terminal; use  │
+    │   │  new ID)        │
     │   └─────────────────┘
     │
     ▼ (sign succeeds)
