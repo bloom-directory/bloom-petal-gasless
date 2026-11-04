@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[workspace]
+
 [dependencies]
 alloy-dyn-abi = { version = "1.6", features = ["eip712"] }
 # Exact-pinned: alloy-dyn-abi's EIP-712 hashing depends on the exact
