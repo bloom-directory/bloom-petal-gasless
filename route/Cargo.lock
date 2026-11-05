@@ -534,7 +534,7 @@ dependencies = [
 [[package]]
 name = "bloom-petal-contract"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/petal?rev=ba13a90f7f10de955d868d01085f34134d8aed3e#ba13a90f7f10de955d868d01085f34134d8aed3e"
+source = "git+https://github.com/bloom-directory/petal?rev=750df682bebd1dd85c48bd22d8741f22ef7a6185#750df682bebd1dd85c48bd22d8741f22ef7a6185"
 dependencies = [
  "hex",
  "serde",
@@ -546,8 +546,10 @@ dependencies = [
 [[package]]
 name = "bloom-petal-sdk"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/petal?rev=ba13a90f7f10de955d868d01085f34134d8aed3e#ba13a90f7f10de955d868d01085f34134d8aed3e"
+source = "git+https://github.com/bloom-directory/petal?rev=750df682bebd1dd85c48bd22d8741f22ef7a6185#750df682bebd1dd85c48bd22d8741f22ef7a6185"
 dependencies = [
+ "alloy-dyn-abi",
+ "alloy-primitives",
  "bloom-petal-contract",
  "getrandom 0.2.17",
  "serde",
@@ -1014,6 +1016,7 @@ dependencies = [
  "alloy-primitives",
  "bloom-petal-sdk",
  "hex",
+ "k256",
  "serde",
  "serde_json",
 ]
@@ -1247,6 +1250,7 @@ dependencies = [
  "elliptic-curve",
  "once_cell",
  "sha2 0.10.9",
+ "signature",
 ]
 
 [[package]]

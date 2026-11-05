@@ -166,7 +166,7 @@ reviewing the transaction for a human should verify the same things:
 | `Relay returned an unsupported EIP-3009 type` | Token uses Permit2 (e.g. USDT) | Use a native USDC contract instead. |
 | `transaction ID already belongs to a different wallet, route, amount, or output constraint` | Tried to change parameters on existing ID | Use a new transaction ID. |
 | `Relay quote permit has expired` | Too much time passed since quoting | Use a new transaction ID. |
-| `permission denied` (after `approval_required`) | Wallet requires ceremony, not yet approved | Approve the action in Bloom, then retry the exact write. An expired or cancelled operation requires a new transaction ID. |
+| `Sealed Approval required` with `retry_write_body` | Wallet requires ceremony, not yet approved | Approve the action in Bloom, then retry the exact write. Pending approval uses code `-3` so the retry instructions remain visible. An expired or cancelled operation requires a new transaction ID. |
 
 ## Hyperliquid
 
@@ -225,3 +225,9 @@ Status reports `approval_expired` or `approval_cancelled` and requests a new
 transaction ID; repeating the same write does not create a fresh ceremony.
 Submitted or ambiguous transactions keep their Relay reconciliation path even
 after local expiry. Never replace one merely because its authorization expired.
+
+Prepared signing uses the SDK's immutable attempt record and live Machine
+status. A signature is recovered against the permit digest and must match the
+selected owner before Relay submission. Approved-but-not-yet-retried actions
+report `ready_to_submit`. A package-changed attempt reports recovery and cannot
+be signed under the new package; reconcile spending operations before upgrading.

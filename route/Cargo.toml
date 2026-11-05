@@ -11,8 +11,11 @@ alloy-dyn-abi = { version = "1.6", features = ["eip712"] }
 # Exact-pinned: alloy-dyn-abi's EIP-712 hashing depends on the exact
 # alloy-primitives version for type encoding compatibility. A patch
 # release could change the encoding and silently invalidate signing hashes.
-alloy-primitives = { version = "=1.6.1", default-features = false, features = ["std"] }
+alloy-primitives = { version = "=1.6.1", default-features = false, features = ["std", "k256"] }
 hex = "0.4"
-petal = { package = "bloom-petal-sdk", git = "https://github.com/bloom-directory/petal", rev = "ba13a90f7f10de955d868d01085f34134d8aed3e" }
+petal = { package = "bloom-petal-sdk", git = "https://github.com/bloom-directory/petal", rev = "750df682bebd1dd85c48bd22d8741f22ef7a6185", features = ["evm"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+k256 = { version = "0.13", features = ["ecdsa"] }

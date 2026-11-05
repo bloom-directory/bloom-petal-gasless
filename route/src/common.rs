@@ -1,5 +1,6 @@
 //! Shared Relay protocol constants, host abstraction, and utilities.
 
+#[cfg(test)]
 use alloy_dyn_abi::eip712::TypedData;
 #[cfg(test)]
 use alloy_primitives::B256;
@@ -7,7 +8,9 @@ use serde_json::{Map, Value, json};
 
 use petal::{DispatchResponse, HostStatus, HttpRequest, HttpResponse, SdkError};
 
-use petal::signing::{PreparedAction, SigningError, SigningOutcome};
+use petal::signing::{CtxHost, SigningHost};
+#[cfg(test)]
+use petal::signing::{ErrorCode, PreparedAction, SigningError, SigningOutcome};
 
 pub(crate) const RELAY: &str = "https://api.relay.link";
 pub(crate) const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
@@ -21,91 +24,33 @@ pub(crate) const PERMIT_SUBMISSION_MARGIN_SECONDS: u64 = 30;
 
 /// Host trait abstracting store, HTTP, signing, and time so that the module
 /// shares a single production implementation and test mocks.
-pub(crate) trait Host {
-    fn store_get(&mut self, key: &str, max_bytes: usize) -> Result<Option<Vec<u8>>, String>;
+pub(crate) trait Host: SigningHost {
+    fn read_store(&mut self, key: &str, max_bytes: usize) -> Result<Option<Vec<u8>>, String>;
     fn store_put(&mut self, key: &str, value: &[u8]) -> Result<(), String>;
-    fn store_put_new(&mut self, key: &str, value: &[u8]) -> Result<bool, String>;
     fn http_fetch(
         &mut self,
         request: &HttpRequest,
         max_bytes: usize,
     ) -> Result<HttpResponse, String>;
-    fn sign(
-        &mut self,
-        wallet: &str,
-        action: &PreparedAction,
-        operation_key: &str,
-    ) -> Result<SigningOutcome, String>;
-    fn signing_status(
-        &mut self,
-        wallet: &str,
-        operation_key: &str,
-    ) -> Result<Option<SigningOutcome>, SigningError>;
-    fn now_ms(&mut self) -> Result<u64, String>;
 }
 
-pub(crate) struct BloomHost<'a> {
-    pub(crate) ctx: &'a petal::Ctx,
-}
-
-impl Host for BloomHost<'_> {
-    fn store_get(&mut self, key: &str, max_bytes: usize) -> Result<Option<Vec<u8>>, String> {
+impl Host for CtxHost<'_> {
+    fn read_store(&mut self, key: &str, max_bytes: usize) -> Result<Option<Vec<u8>>, String> {
         match petal::sdk::store_get(key, max_bytes) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(SdkError::Host(HostStatus::NotFound)) => Ok(None),
             Err(error) => Err(error.message()),
         }
     }
-
     fn store_put(&mut self, key: &str, value: &[u8]) -> Result<(), String> {
         petal::sdk::store_put(key, value, false).map_err(|error| error.message())
     }
-
-    fn store_put_new(&mut self, key: &str, value: &[u8]) -> Result<bool, String> {
-        match petal::sdk::store_put_new(key, value, false) {
-            Ok(()) => Ok(true),
-            Err(SdkError::Host(HostStatus::Denied)) => Ok(false),
-            Err(error) => Err(error.message()),
-        }
-    }
-
     fn http_fetch(
         &mut self,
         request: &HttpRequest,
         max_bytes: usize,
     ) -> Result<HttpResponse, String> {
         petal::sdk::http_fetch(request, max_bytes).map_err(|error| error.message())
-    }
-
-    fn sign(
-        &mut self,
-        wallet: &str,
-        action: &PreparedAction,
-        operation_key: &str,
-    ) -> Result<SigningOutcome, String> {
-        petal::signing::sign(self.ctx, wallet, action, operation_key)
-            .map_err(|error| error.to_string())
-    }
-
-    fn signing_status(
-        &mut self,
-        wallet: &str,
-        operation_key: &str,
-    ) -> Result<Option<SigningOutcome>, SigningError> {
-        match petal::signing::status(self.ctx, wallet, operation_key) {
-            Ok(outcome) => Ok(Some(outcome)),
-            Err(error)
-                if error.code == petal::signing::ErrorCode::Invalid
-                    && error.message == "operation not found" =>
-            {
-                Ok(None)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    fn now_ms(&mut self) -> Result<u64, String> {
-        petal::sdk::try_now_ms().map_err(|error| error.message())
     }
 }
 
@@ -115,10 +60,6 @@ impl Host for BloomHost<'_> {
 
 pub(crate) fn invalid(message: impl Into<String>) -> DispatchResponse {
     petal::error(-3, message)
-}
-
-pub(crate) fn denied(message: impl Into<String>) -> DispatchResponse {
-    petal::error(-2, message)
 }
 
 pub(crate) fn backend(message: impl Into<String>) -> DispatchResponse {
@@ -261,6 +202,7 @@ pub(crate) fn typed_data(sign: &Value) -> Result<Value, DispatchResponse> {
         "domain": sign.get("domain"), "message": sign.get("value")}))
 }
 
+#[cfg(test)]
 pub(crate) fn signing_preimage(sign: &Value) -> Result<Vec<u8>, DispatchResponse> {
     let typed: TypedData = serde_json::from_value(typed_data(sign)?)
         .map_err(|error| backend(format!("invalid Relay typed data: {error}")))?;
@@ -308,21 +250,13 @@ pub(crate) mod test_helpers {
     }
 
     impl Host for MockHost {
-        fn store_get(&mut self, key: &str, _max_bytes: usize) -> Result<Option<Vec<u8>>, String> {
+        fn read_store(&mut self, key: &str, _max_bytes: usize) -> Result<Option<Vec<u8>>, String> {
             Ok(self.store.get(key).cloned())
         }
 
         fn store_put(&mut self, key: &str, value: &[u8]) -> Result<(), String> {
             self.store.insert(key.into(), value.to_vec());
             Ok(())
-        }
-
-        fn store_put_new(&mut self, key: &str, value: &[u8]) -> Result<bool, String> {
-            if self.store.contains_key(key) {
-                return Ok(false);
-            }
-            self.store.insert(key.into(), value.to_vec());
-            Ok(true)
         }
 
         fn http_fetch(
@@ -335,31 +269,57 @@ pub(crate) mod test_helpers {
                 .pop_front()
                 .expect("unexpected HTTP request")
         }
+    }
+
+    impl SigningHost for MockHost {
+        fn package_hash(&self) -> &str {
+            "test-package"
+        }
+        fn store_get(&mut self, key: &str) -> Result<Option<Vec<u8>>, SigningError> {
+            Ok(self.store.get(key).cloned())
+        }
+        fn store_put_new(&mut self, key: &str, value: &[u8]) -> Result<bool, SigningError> {
+            if self.store.contains_key(key) {
+                return Ok(false);
+            }
+            self.store.insert(key.into(), value.to_vec());
+            Ok(true)
+        }
 
         fn sign(
             &mut self,
             wallet: &str,
             action: &PreparedAction,
             operation_key: &str,
-        ) -> Result<SigningOutcome, String> {
+        ) -> Result<SigningOutcome, SigningError> {
             self.sign_requests
                 .push((wallet.into(), action.clone(), operation_key.into()));
             self.sign_results
                 .pop_front()
                 .expect("unexpected signing request")
+                .map_err(|message| SigningError {
+                    code: ErrorCode::Backend,
+                    message,
+                })
         }
 
-        fn signing_status(
+        fn status(
             &mut self,
             wallet: &str,
             operation_key: &str,
-        ) -> Result<Option<SigningOutcome>, SigningError> {
+        ) -> Result<SigningOutcome, SigningError> {
             self.status_requests
                 .push((wallet.into(), operation_key.into()));
-            self.status_results.pop_front().unwrap_or(Ok(None))
+            self.status_results
+                .pop_front()
+                .unwrap_or(Ok(None))?
+                .ok_or(SigningError {
+                    code: ErrorCode::NotFound,
+                    message: "not found".into(),
+                })
         }
 
-        fn now_ms(&mut self) -> Result<u64, String> {
+        fn now_ms(&mut self) -> Result<u64, SigningError> {
             Ok(self.now_ms)
         }
     }
@@ -371,9 +331,11 @@ pub(crate) mod test_helpers {
         }
     }
 
-    pub(crate) fn signature() -> SigningOutcome {
-        let mut bytes = vec![0xab; 65];
-        bytes[64] = 0;
-        SigningOutcome::Signed { signature: bytes }
+    pub(crate) fn signature(hash: alloy_primitives::B256) -> SigningOutcome {
+        let key = k256::ecdsa::SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
+        let (sig, recovery) = key.sign_prehash_recoverable(hash.as_slice()).unwrap();
+        let mut signature = sig.to_bytes().to_vec();
+        signature.push(recovery.to_byte());
+        SigningOutcome::Signed { signature }
     }
 }
