@@ -4,7 +4,7 @@ petal::route_file!(
         "petal": "gasless",
         "status": "ok",
         "description": "Gasless EIP-3009 permit transfers and swaps via Relay. The wallet signs a permit instead of an on-chain transaction, so no origin gas token is required.",
-        "canonical_route": "transactions/<wallet>/<id>.json",
+        "canonical_route": "transactions/<wallet>/<index>/<id>.json",
         "operations": ["same-chain-swap", "cross-chain-swap", "transfer"],
         "provider": "relay",
         "signing_kind": "eip3009-permit",

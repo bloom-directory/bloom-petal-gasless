@@ -9,8 +9,8 @@ pub use relay::{
 };
 pub use serde_json;
 
-pub fn wallet_address(wallet: &str) -> Result<String, petal::DispatchResponse> {
-    let path = format!("wallets/{wallet}/address");
+pub fn wallet_address(wallet: &str, index: &str) -> Result<String, petal::DispatchResponse> {
+    let path = format!("wallets/{wallet}/{index}/address.evm");
     let bytes =
         petal::sdk::vfs_read(&path, 128).map_err(|error| petal::error(-4, error.message()))?;
     let address = core::str::from_utf8(&bytes)

@@ -1,0 +1,26 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main, codex/persona-eip3009-prepared]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: route
+      - run: cargo fmt --manifest-path route/Cargo.toml -- --check
+      - run: cargo test --manifest-path route/Cargo.toml --locked
+      - run: cargo clippy --manifest-path route/Cargo.toml --locked --all-targets -- -D warnings
+      - run: cargo install wasm-tools --version 1.249.0 --locked
+      - run: cargo install --git https://github.com/bloom-directory/petal --rev ba13a90f7f10de955d868d01085f34134d8aed3e --locked bloom-petal-cli
+      - run: scripts/build.sh
+      - run: petal check --root .

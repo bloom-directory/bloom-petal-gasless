@@ -5,7 +5,7 @@
 | Route | Read | Write |
 |---|---|---|
 | `/petals/gasless/status.json` | Health + capability info (no side effects) | — |
-| `/petals/gasless/transactions/<wallet>/<id>.json` | Transaction state + `next` action | Create or advance transaction |
+| `/petals/gasless/transactions/<wallet>/<index>/<id>.json` | Transaction state + `next` action | Create or advance transaction |
 
 `<wallet>` is a Bloom wallet alias — resolve its EVM address through the VFS for
 Relay, but retain the alias for Bloom signing. `<id>` is a caller-defined,
@@ -91,8 +91,8 @@ be any Relay-supported chain/currency, including Hyperliquid (chain_id 1337).
     │          ▼
     │   ┌─────────────────┐
     │   │ approval_expired│
-    │   │ (retry write →  │
-    │   │  fresh ceremony)│
+    │   │ (terminal; use  │
+    │   │  new ID)        │
     │   └─────────────────┘
     │
     ▼ (sign succeeds)
@@ -126,7 +126,7 @@ Every read returns a JSON object with:
   applicable)
 - `request` — the original bound request
 - `quote` — Relay's quote details (amounts, fees, timing, permit expiry)
-- `approval` — ceremony URL and expiry (only when `approval_required`)
+- `approval` — action ID and expiry when approval is required, or recovery details when signing needs reconciliation
 - `submission` — `"accepted"` or `"unknown"` (after signing)
 - `relay` — projected Relay status with tx hashes (after submission)
 
@@ -134,9 +134,9 @@ Every read returns a JSON object with:
 
 | `next.action` | When | What to do |
 |---|---|---|
-| `review_route_then_approve` | `approval_required` | Review origin/destination/amount/output. Open `approval.ceremony_url`. After approval, retry the exact `next.retry_write_body`. |
-| `retry_write` | `approval_expired` or unknown status | Retry the write with `next.retry_write_body` to get a fresh ceremony or re-attempt signing. |
-| `create_new_transaction` | `quote_expired` | This ID is dead. Create a new transaction with a new ID. |
+| `review_route_then_approve` | `approval_required` | Review origin/destination/amount/output. Approve `approval.action_id` in Bloom. After approval, retry the exact `next.retry_write_body`. |
+| `retry_write` | Unfinished non-terminal signing | Retry the exact write to resume the same signing operation. |
+| `create_new_transaction` | `quote_expired`, `approval_expired` or `approval_cancelled` | The operation is terminal. Create a fresh transaction with a new ID. |
 | `poll` | `submitting` through `delayed` | Read again later. Only Relay `success` means done. |
 | `complete` | `success` | Settlement confirmed. |
 | `inspect` | `refund` or `failure` | Check `relay.tx_hashes`. Terminal — funds were returned or lost. |
@@ -166,7 +166,7 @@ reviewing the transaction for a human should verify the same things:
 | `Relay returned an unsupported EIP-3009 type` | Token uses Permit2 (e.g. USDT) | Use a native USDC contract instead. |
 | `transaction ID already belongs to a different wallet, route, amount, or output constraint` | Tried to change parameters on existing ID | Use a new transaction ID. |
 | `Relay quote permit has expired` | Too much time passed since quoting | Use a new transaction ID. |
-| `permission denied` (after `approval_required`) | Wallet requires ceremony, not yet approved | Open ceremony URL, approve, retry write. |
+| `Sealed Approval required` with `retry_write_body` | Wallet requires ceremony, not yet approved | Approve the action in Bloom, then retry the exact write. Pending approval uses code `-3` so the retry instructions remain visible. An expired or cancelled operation requires a new transaction ID. |
 
 ## Hyperliquid
 
@@ -195,3 +195,39 @@ Live quote-only validation is allowed.
 Petals are authored against the `bloom-petal-development` skill:
 https://github.com/bloom-directory/petal/tree/main/skills/bloom-petal-development
 Load it into your agent before extending this Petal.
+
+## Prepared signing and numbered accounts
+
+`<index>` selects the numbered Bloom account, including account 0. The route
+reads `wallets/<wallet>/<index>/address.evm`; each account has separate private
+transaction state. Signing uses the canonical prepared-action API with complete
+EIP-712 input, an exact token debit and a durable operation key bound to the
+transaction and Relay request. Retrying after approval resumes that operation.
+Recovery outcomes stay visible in transaction status. Reads never expose the
+signature. Ambiguous submissions must be reconciled by reading status; another
+write does not sign or submit again.
+
+Covered Trader/Degen authorization requires explicit owner opt-in for the
+exact installed package. The package declares its exact origin-token debit;
+Broker trusts this installer-signed declaration and applies the generic account,
+network, token-policy and budget checks. The Petal validates the EIP-3009
+payload and Relay route. Generic review binds the displayed typed data to the
+signing bytes; it does not prove destination settlement or economic value.
+Institutional requires individual approval. Status is read from Bloom's
+prepared-signing status API, never a cached private approval record.
+
+Before upgrading from the unnumbered route, reconcile pending operations with
+the installed build and retain its package/private records. This build does not
+import unnumbered state or reinterpret old approvals, even for account 0.
+
+Expired or cancelled prepared signing operations retain their original identity.
+Status reports `approval_expired` or `approval_cancelled` and requests a new
+transaction ID; repeating the same write does not create a fresh ceremony.
+Submitted or ambiguous transactions keep their Relay reconciliation path even
+after local expiry. Never replace one merely because its authorization expired.
+
+Prepared signing uses the SDK's immutable attempt record and live Machine
+status. A signature is recovered against the permit digest and must match the
+selected owner before Relay submission. Approved-but-not-yet-retried actions
+report `ready_to_submit`. A package-changed attempt reports recovery and cannot
+be signed under the new package; reconcile spending operations before upgrading.

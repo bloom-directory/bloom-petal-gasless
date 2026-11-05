@@ -1,0 +1,27 @@
+name: Release Petal
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # Keep this reference pinned to the full commit SHA that defines the
+    # packaging and release contract; do not replace it with a branch or tag.
+    uses: bloom-directory/petal/.github/workflows/release-petal.yml@465d6f2464a6a87910128f5448d1543ccb2aeb2a
+    with:
+      petal-name: gasless
+      # This independently pins the canonical CLI used to build and package the
+      # release to the same reviewed tooling commit as `uses:`.
+      petal-tooling-ref: "465d6f2464a6a87910128f5448d1543ccb2aeb2a"
+      build-command: scripts/build.sh
+      package-root: .
+      expected-route-count: 6
